@@ -30,7 +30,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List
 
-from aps_engine.models import Dataset
+from aps_engine.models import Dataset, changeover
 
 MATERIAL_VIOLATION = "MATERIAL_VIOLATION"
 
@@ -250,15 +250,21 @@ def validate(dataset: Dataset, schedule: Dict) -> ValidationResult:
                     f"[{intervals[b][0]},{intervals[b][1]}]"))
 
     # machine setup / changeover: between consecutive operations on the same
-    # machine the gap must cover the setup time of the following operation
+    # machine the gap must cover the changeover of that pair (the setup-matrix
+    # value when both operations carry a setup_family_id and the dataset
+    # defines a setup_matrix, else the setup time of the following operation;
+    # ``changeover`` is the shared source of truth with the solver). The
+    # window -> operation bound (``op.setup_time``) is unchanged: maintenance
+    # / downtime windows are checked separately above.
     for mid, intervals in by_machine.items():
         intervals.sort(key=lambda x: (x[0], x[1]))
         for a in range(len(intervals) - 1):
             prev, nxt = intervals[a], intervals[a + 1]
+            prev_op = dataset.operations.get(prev[2])
             nxt_op = dataset.operations.get(nxt[2])
-            if nxt_op is None:
+            if prev_op is None or nxt_op is None:
                 continue  # unknown operation reported elsewhere
-            setup = nxt_op.setup_time
+            setup = changeover(dataset, prev_op, nxt_op)
             if nxt[0] < prev[1] + setup:
                 v.violations.append(Violation(
                     "SETUP_VIOLATION", f"{prev[2]}->{nxt[2]}",

@@ -34,6 +34,14 @@ Material-feasible variant (Phase 4.7 Part 2): ``material_feasible=True`` on
 ``generate_dataset`` raises every on-hand quantity to exactly cover the whole
 order book's aggregated demand, keeping BOMs, products, orders, and all
 scheduling data unchanged. The default stays material-infeasible.
+
+Sequence-dependent setup variant (Phase 6 P4): ``sequence_dependent_setup=True``
+on ``generate_dataset`` assigns a changeover ``setup_family_id`` (per product)
+to every operation and fills the global ``setup_matrix`` with deterministic
+family-pair changeover values (reduced same-family diagonal, elevated
+cross-family values), so the solver, validator, greedy scheduler and CLI setup
+summary all exercise the sequence-dependent path. The default stays
+sequence-independent (empty families, empty matrix).
 """
 
 from __future__ import annotations
@@ -138,6 +146,28 @@ PRODUCTS = {
     "P_SHELF": ["CUT", "EDGE", "ASM"],
 }
 
+# --- sequence-dependent setup (Phase 6 P4) ------------------------------------
+# product id -> changeover family; every operation of a product shares it, so
+# cross-family changeovers happen between different products on a machine.
+SETUP_FAMILIES: Dict[str, str] = {
+    "P_CABINET": "CABINET",
+    "P_WARDROBE": "WARDROBE",
+    "P_DESK": "DESK",
+    "P_TV_STAND": "TV_STAND",
+    "P_SHELF": "SHELF",
+}
+
+# family id -> changeover base (minutes); a cross-family changeover is the sum
+# of the two bases, a same-family changeover is the shared diagonal value.
+SETUP_FAMILY_BASE: Dict[str, int] = {
+    "CABINET": 25,
+    "WARDROBE": 30,
+    "DESK": 20,
+    "TV_STAND": 15,
+    "SHELF": 10,
+}
+SAME_FAMILY_SETUP = 5
+
 WORK_CENTERS = {
     "WC_CUTTING": ("Cutting", ["CUT-1", "CUT-2"]),
     "WC_EDGE_BANDING": ("Edge banding", ["EDGE-1", "EDGE-2"]),
@@ -240,6 +270,21 @@ def _build_employees(ds: Dataset) -> None:
         )
 
 
+def _build_setup_matrix() -> Dict[Tuple[str, str], int]:
+    """Deterministic global changeover matrix for the setup-family variant.
+
+    Same-family pairs use the reduced ``SAME_FAMILY_SETUP`` diagonal; a
+    cross-family changeover is the sum of the two families' bases. The matrix
+    is complete (every ordered family pair has a value), so no entry falls
+    back to an operation's ``setup_time`` when both families are set.
+    """
+    matrix: Dict[Tuple[str, str], int] = {}
+    for a, base_a in SETUP_FAMILY_BASE.items():
+        for b, base_b in SETUP_FAMILY_BASE.items():
+            matrix[(a, b)] = SAME_FAMILY_SETUP if a == b else base_a + base_b
+    return matrix
+
+
 def _cover_order_book(ds: Dataset) -> None:
     """Raise on-hand inventory to exactly cover the whole order book.
 
@@ -257,18 +302,24 @@ def _cover_order_book(ds: Dataset) -> None:
 
 
 def generate_dataset(n_orders: int = N_ORDERS, seed: int = SEED,
-                     material_feasible: bool = False) -> Dataset:
+                     material_feasible: bool = False,
+                     sequence_dependent_setup: bool = False) -> Dataset:
     """Build the deterministic Phase 3 dataset.
 
     When ``material_feasible`` is True, on-hand inventory is raised to exactly
     cover the entire order book's aggregated demand so the dataset is
-    material-feasible; everything else stays identical to the default.
+    material-feasible; everything else stays identical to the default. When
+    ``sequence_dependent_setup`` is True, every operation gets a per-product
+    ``setup_family_id`` and the global ``setup_matrix`` is populated with
+    deterministic family-pair changeovers; the default stays
+    sequence-independent. Both options are independent.
     """
     rng = random.Random(seed)
     ds = Dataset()
     ds.meta["seed"] = seed
     ds.meta["n_orders"] = n_orders
     ds.meta["material_feasible"] = material_feasible
+    ds.meta["sequence_dependent_setup"] = sequence_dependent_setup
     ds.meta["horizon_end"] = N_DAYS * DAY_MINUTES
 
     # work centers + machines
@@ -332,6 +383,10 @@ def generate_dataset(n_orders: int = N_ORDERS, seed: int = SEED,
     if material_feasible:
         _cover_order_book(ds)
 
+    # Phase 6 P4: sequence-dependent setup data when requested
+    if sequence_dependent_setup:
+        ds.setup_matrix = _build_setup_matrix()
+
     # operations (per order) + per-order routing
     seq_counter = 0
     for o in orders:
@@ -352,6 +407,8 @@ def generate_dataset(n_orders: int = N_ORDERS, seed: int = SEED,
                 required_skill_id=STEP_SKILL[step],
                 employee_required=True,
             )
+            if sequence_dependent_setup:
+                op.setup_family_id = SETUP_FAMILIES[o.product_id]
             # one single-machine operation for variety (DESK assembly on ASM-1)
             if o.product_id == "P_DESK" and step == "ASM":
                 op.allowed_machine_ids = ["ASM-1"]

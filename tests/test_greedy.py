@@ -21,6 +21,14 @@ import copy
 import pytest
 
 from aps_engine.generator import generate_dataset
+from aps_engine.models import (
+    Dataset,
+    Machine,
+    Operation,
+    Order,
+    Routing,
+    WorkCenter,
+)
 from aps_engine.solver.greedy import greedy_solve
 from aps_engine.validation.validator import validate
 
@@ -195,3 +203,47 @@ def test_dataset_not_mutated(ds_feasible):
     snapshot = copy.deepcopy(ds_feasible)
     greedy_solve(ds_feasible)
     assert ds_feasible == snapshot
+
+
+# TEST 13 ---------------------------------------------------------------------
+def _family_ds(matrix, fam_a="PANEL", fam_b="FLAT"):
+    """Two sequential same-machine ops with setup families, 24/7, no employees."""
+    ds = Dataset()
+    ds.machines["M1"] = Machine(id="M1", name="M1", work_center_id="WC1")
+    ds.work_centers["WC1"] = WorkCenter(id="WC1", name="WC1", machine_ids=["M1"])
+    ds.setup_matrix = dict(matrix)
+    ds.operations["OP0"] = Operation(
+        id="OP0", order_id="ORD0", sequence=0, work_center_id="WC1",
+        processing_time=60, setup_time=15, setup_family_id=fam_a,
+        allowed_machine_ids=["M1"])
+    ds.operations["OP1"] = Operation(
+        id="OP1", order_id="ORD0", sequence=1, work_center_id="WC1",
+        processing_time=60, setup_time=15, setup_family_id=fam_b,
+        allowed_machine_ids=["M1"])
+    ds.orders["ORD0"] = Order(id="ORD0", product_id="P1", quantity=1,
+                              release_time=0, due_time=100_000, priority=1)
+    ds.routings["ORD0"] = Routing(product_id="P1", operations=["OP0", "OP1"])
+    ds.meta["horizon_end"] = 100_000
+    return ds
+
+
+def test_greedy_respects_matrix_changeover_gap():
+    ds = _family_ds({("PANEL", "FLAT"): 30, ("FLAT", "PANEL"): 20})
+    out = greedy_solve(ds)
+    by_id = _by_id(out["schedule"])
+    assert by_id["OP0"]["start"] == 0
+    assert by_id["OP1"]["start"] == 90  # matrix 30 binds, not setup_time 15
+
+
+def test_greedy_same_family_uses_diagonal():
+    ds = _family_ds({("PANEL", "PANEL"): 5}, fam_b="PANEL")
+    out = greedy_solve(ds)
+    by_id = _by_id(out["schedule"])
+    assert by_id["OP1"]["start"] == 65  # diagonal 5 < setup_time 15
+
+
+def test_greedy_family_dataset_validates():
+    ds = generate_dataset(sequence_dependent_setup=True, material_feasible=True)
+    out = greedy_solve(ds)
+    assert out["result"].feasible
+    assert validate(ds, out["schedule"]).valid

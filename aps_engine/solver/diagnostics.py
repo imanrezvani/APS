@@ -1,10 +1,10 @@
-"""Phase 4 Part 2: infeasibility diagnostics.
+"""Phase 4 Part 2 + Phase 6 Part 5: infeasibility diagnostics.
 
-Bounded layered analysis invoked when CP-SAT returns INFEASIBLE. It does NOT
-relax or weaken any constraint and it does NOT prove an exact mathematical
-root cause: each layer reports only PROVEN necessary-condition violations.
-If every local check passes but the model is still infeasible, the honest
-answer is GLOBAL_SCHEDULING_CONFLICT.
+Phase 4 Part 2 (``build_diagnostics``): bounded layered analysis invoked when
+CP-SAT returns INFEASIBLE. It does NOT relax or weaken any constraint and it
+does NOT prove an exact mathematical root cause: each layer reports only
+PROVEN necessary-condition violations. If every local check passes but the
+model is still infeasible, the honest answer is GLOBAL_SCHEDULING_CONFLICT.
 
 Layers (mirror the structure of ``solver/model.py``):
 
@@ -14,21 +14,31 @@ Layers (mirror the structure of ``solver/model.py``):
   4. employee availability            (availability windows too short)
   5. calendar / precedence            (op cannot fit any slot, chain too long)
   6. material availability            (aggregate order-book demand > on-hand,
-                                      reported as a data-level availability
-                                      fact; the solver's material constraint is
-                                      time-phased, so this is a strong signal
-                                      rather than an exact proof)
+                                       reported as a data-level availability
+                                       fact; the solver's material constraint is
+                                       time-phased, so this is a strong signal
+                                       rather than an exact proof)
   7. fallback                         GLOBAL_SCHEDULING_CONFLICT
 
 Each diagnostic dict carries:
   code, order_id, operation_id, resource_type, resource_id, reason
+
+Phase 6 Part 5 (``analyze_infeasibility``): a thin post-solve root-cause layer
+that consumes the layered diagnostics plus additional deterministic evidence
+(machine capacity, maintenance/downtime windows, sequence setup/changeover
+overhead) and ranks the detected causes into a single deterministic root
+cause. It never relaxes a constraint, never runs a solver and never overrides
+the Phase 4 diagnostics: it only maps and ranks them. When no cause is proven
+the honest answer is UNKNOWN_INFEASIBILITY.
 """
 
 from __future__ import annotations
 
+import itertools
+from collections import Counter
 from typing import Dict, List, Optional, Tuple
 
-from aps_engine.models import Dataset
+from aps_engine.models import Dataset, changeover
 from aps_engine.validation.pre_solve import ERROR, pre_solve_validate
 
 MACHINE_SHORTAGE = "MACHINE_SHORTAGE"
@@ -269,3 +279,413 @@ def build_diagnostics(ds: Dataset) -> List[Dict]:
                    "feasible schedule (global scheduling conflict)")
 
     return diags
+
+
+# ===========================================================================
+# Phase 6 Part 5: post-solve feasibility root-cause analysis.
+#
+# A deterministic layer on top of ``build_diagnostics`` (and the additional
+# evidence checks below). It returns a structured report and never modifies
+# the Phase 4 diagnostics list.
+# ===========================================================================
+
+CAPACITY_SHORTAGE = "CAPACITY_SHORTAGE"
+MACHINE_CAPACITY = CAPACITY_SHORTAGE  # alias for the same category
+CALENDAR_LIMITATION = "CALENDAR_LIMITATION"
+MAINTENANCE_DOWNTIME = "MAINTENANCE_DOWNTIME"
+SETUP_CHANGEOVER_BURDEN = "SETUP_CHANGEOVER_BURDEN"
+STRUCTURAL_INVALIDITY = "STRUCTURAL_INVALIDITY"
+UNKNOWN_INFEASIBILITY = "UNKNOWN_INFEASIBILITY"
+
+# Phase 4 / greedy diagnostic codes -> P5 root-cause categories. Codes not
+# listed here (UNKNOWN_ORDER, UNKNOWN_MACHINE, DUPLICATE_OPERATION,
+# INVALID_*, ...) are precise structural data errors and map to
+# STRUCTURAL_INVALIDITY.
+_P4_TO_P5 = {
+    MACHINE_SHORTAGE: CAPACITY_SHORTAGE,
+    EMPLOYEE_SHORTAGE: EMPLOYEE_SHORTAGE,
+    SKILL_SHORTAGE: EMPLOYEE_SHORTAGE,
+    WORK_CENTER_SHORTAGE: EMPLOYEE_SHORTAGE,
+    EMPLOYEE_AVAILABILITY: EMPLOYEE_SHORTAGE,
+    CALENDAR_CONFLICT: CALENDAR_LIMITATION,
+    HORIZON_CONFLICT: CALENDAR_LIMITATION,
+    PRECEDENCE_CONFLICT: CALENDAR_LIMITATION,
+    MATERIAL_SHORTAGE: MATERIAL_SHORTAGE,
+    GLOBAL_SCHEDULING_CONFLICT: UNKNOWN_INFEASIBILITY,
+    "SCHEDULING_FAILURE": UNKNOWN_INFEASIBILITY,  # greedy reference solver
+}
+_KNOWN_P4_CODES = frozenset(_P4_TO_P5)
+
+# Deterministic severity ranking: a lower rank number is the more fundamental
+# cause and is reported first. Structural data errors outrank inventory, then
+# staffing, then machine capacity, then machine blocking, then the planning
+# window, then sequence setup overhead, and finally the honest UNKNOWN
+# fallback.
+_RANK = {
+    STRUCTURAL_INVALIDITY: 1,
+    MATERIAL_SHORTAGE: 2,
+    EMPLOYEE_SHORTAGE: 3,
+    CAPACITY_SHORTAGE: 4,
+    MAINTENANCE_DOWNTIME: 5,
+    CALENDAR_LIMITATION: 6,
+    SETUP_CHANGEOVER_BURDEN: 7,
+    UNKNOWN_INFEASIBILITY: 8,
+}
+
+# Confidence reflects proof strength: HIGH means the category is a PROVEN
+# necessary-condition violation of the model; MEDIUM covers per-operation
+# eligibility signals that still depend on assignment freedom; LOW means no
+# cause was proven. Deterministic per category.
+_CONFIDENCE = {
+    STRUCTURAL_INVALIDITY: "HIGH",
+    MATERIAL_SHORTAGE: "HIGH",
+    CALENDAR_LIMITATION: "HIGH",
+    CAPACITY_SHORTAGE: "HIGH",
+    MAINTENANCE_DOWNTIME: "HIGH",
+    SETUP_CHANGEOVER_BURDEN: "HIGH",
+    EMPLOYEE_SHORTAGE: "MEDIUM",
+    UNKNOWN_INFEASIBILITY: "LOW",
+}
+
+
+def _horizon(ds: Dataset) -> int:
+    return ds.meta.get("horizon_end", 100_000)
+
+
+def _known_machines(ds: Dataset, op) -> List[str]:
+    return [mid for mid in op.allowed_machine_ids if mid in ds.machines]
+
+
+def _machine_working_time(ds: Dataset, horizon: int) -> int:
+    """Factory working minutes available to every machine (the calendar)."""
+    slots = _working_slots(ds)
+    if not slots:
+        return horizon  # no calendar -> backward-compatible 24/7 availability
+    return sum(s1 - s0 for _, s0, s1 in slots)
+
+
+def _exclusive_ops_by_machine(ds: Dataset) -> Dict[str, List]:
+    """Operations that can run on exactly one known machine, grouped by it.
+
+    Only exclusive operations can prove a per-machine capacity, maintenance
+    or setup shortage: an operation that may use several machines cannot
+    prove that a single machine is the bottleneck.
+    """
+    by_machine: Dict[str, List] = {mid: [] for mid in ds.machines}
+    for op in ds.operations.values():
+        known = _known_machines(ds, op)
+        if len(known) == 1:
+            by_machine[known[0]].append(op)
+    return by_machine
+
+
+def _longest_slot(ds: Dataset, horizon: int) -> int:
+    """Longest working slot length; ``horizon`` when there is no calendar."""
+    slots = _working_slots(ds)
+    return max((s1 - s0 for _, s0, s1 in slots), default=horizon)
+
+
+def _capacity_evidence(ds: Dataset, horizon: int) -> Dict:
+    """Proven machine capacity shortages.
+
+    Per machine: the total processing time of its exclusive operations exceeds
+    the machine's calendar working time. Aggregated: total processing demand
+    of every operation exceeds total machine working time (n_machines x
+    calendar minutes). Both are necessary conditions of feasibility.
+
+    Only operations that individually fit a working slot are counted: an
+    operation longer than every slot is a calendar limitation, not a machine
+    capacity shortage.
+    """
+    longest = _longest_slot(ds, horizon)
+    schedulable = lambda op: op.processing_time <= longest
+    evidence: Dict = {}
+    available = _machine_working_time(ds, horizon)
+    for mid, ops in sorted(_exclusive_ops_by_machine(ds).items()):
+        fit = [op for op in ops if schedulable(op)]
+        if not fit:
+            continue
+        total = sum(op.processing_time for op in fit)
+        if total > available:
+            evidence.setdefault("machines", {})[mid] = {
+                "required": total,
+                "available": available,
+                "operations": sorted(op.id for op in fit),
+            }
+    total_demand = sum(op.processing_time for op in ds.operations.values()
+                       if schedulable(op))
+    total_capacity = len(ds.machines) * available
+    if total_demand > total_capacity:
+        evidence["aggregate"] = {"required": total_demand,
+                                 "available": total_capacity}
+    return evidence
+
+
+def _longest_free_window(ds: Dataset, mid: str) -> Optional[int]:
+    """Longest maintenance/downtime-free contiguous interval on a machine.
+
+    Computed from the factory working slots minus the machine's fixed
+    maintenance and downtime windows. None when there is no calendar (24/7).
+    """
+    slots = _working_slots(ds)
+    if not slots:
+        return None
+    blocked = sorted(
+        [(w.start, w.end) for w in ds.maintenance if w.machine_id == mid]
+        + [(w.start, w.end) for w in ds.downtime if w.machine_id == mid])
+    longest = 0
+    for _, s0, s1 in slots:
+        free = [(s0, s1)]
+        for bs, be in blocked:
+            nxt = []
+            for fs, fe in free:
+                if be <= fs or bs >= fe:
+                    nxt.append((fs, fe))
+                else:
+                    if bs > fs:
+                        nxt.append((fs, bs))
+                    if be < fe:
+                        nxt.append((be, fe))
+            free = nxt
+        for fs, fe in free:
+            longest = max(longest, fe - fs)
+    return longest
+
+
+def _maintenance_evidence(ds: Dataset, horizon: int) -> Dict:
+    """Proven maintenance/downtime shortages.
+
+    An exclusive operation that fits a plain working slot but cannot fit any
+    maintenance/downtime-free window on its only machine proves that the fixed
+    windows block the schedule.
+    """
+    evidence: Dict = {}
+    slots = _working_slots(ds)
+    longest_slot = max((s1 - s0 for _, s0, s1 in slots), default=0)
+    for mid, ops in sorted(_exclusive_ops_by_machine(ds).items()):
+        if not ops or not slots:
+            continue
+        longest_free = _longest_free_window(ds, mid)
+        if longest_free is None:
+            continue
+        for op in sorted(ops, key=lambda o: o.id):
+            if op.processing_time > longest_slot:
+                continue  # calendar limitation, not maintenance
+            if op.processing_time > longest_free:
+                evidence.setdefault("machines", {})[mid] = {
+                    "longest_free_window": longest_free,
+                    "operation": op.id,
+                    "needed": op.processing_time,
+                }
+                break  # one operation per machine is enough evidence
+    return evidence
+
+
+def _min_sequence_setup(ds: Dataset, ops: List) -> int:
+    """Exact minimum changeover overhead to run ``ops`` on one machine.
+
+    The first operation on a machine pays no setup (mirroring the solver);
+    every later operation pays the changeover from its predecessor. Returns
+    the minimum over all orderings, or a sound lower bound for large sets.
+    """
+    if len(ops) < 2:
+        return 0
+    if len(ops) > 7:
+        min_in = [
+            min([op.setup_time] + [changeover(ds, q, op)
+                                   for q in ops if q.id != op.id])
+            for op in ops]
+        return sum(min_in) - max(min_in)
+    best = None
+    for perm in itertools.permutations(ops):
+        total = 0
+        prev = None
+        for op in perm:
+            if prev is not None:
+                total += changeover(ds, prev, op)
+            prev = op
+        if best is None or total < best:
+            best = total
+    return best
+
+
+def _setup_evidence(ds: Dataset, horizon: int) -> Dict:
+    """Proven setup/changeover burden.
+
+    For a machine whose exclusive operations fit by processing time alone but
+    whose minimum possible changeover overhead pushes the workload past the
+    machine's calendar working time, the setup/changeover requirement is the
+    cause. Capacity overflows are left to CAPACITY_SHORTAGE (more
+    fundamental).
+    """
+    evidence: Dict = {}
+    longest = _longest_slot(ds, horizon)
+    schedulable = lambda op: op.processing_time <= longest
+    available = _machine_working_time(ds, horizon)
+    for mid, ops in sorted(_exclusive_ops_by_machine(ds).items()):
+        fit = [op for op in ops if schedulable(op)]
+        if len(fit) < 2:
+            continue
+        total_proc = sum(op.processing_time for op in fit)
+        if total_proc > available:
+            continue  # capacity shortage is the more fundamental cause
+        min_setup = _min_sequence_setup(ds, fit)
+        if min_setup <= 0:
+            continue
+        if total_proc + min_setup > available:
+            evidence.setdefault("machines", {})[mid] = {
+                "processing": total_proc,
+                "min_changeover": min_setup,
+                "available": available,
+                "operations": sorted(op.id for op in fit),
+            }
+    return evidence
+
+
+def _describe(root: str, ranked, ds: Dataset, diagnostics: List[Dict],
+              capacity: Dict, maintenance: Dict, setup: Dict) -> List[str]:
+    """Concise, human-readable detail lines for the primary root cause."""
+    lines: List[str] = []
+    if root == STRUCTURAL_INVALIDITY:
+        first = next(
+            (d for d in diagnostics if d.get("code") not in _KNOWN_P4_CODES),
+            None)
+        if first is not None:
+            lines.append(
+                f"the dataset contains structural data errors "
+                f"({len(diagnostics)} diagnostic(s)); first: "
+                f"{first['code']}: {first['reason']}")
+        else:
+            lines.append(f"the dataset contains structural data errors "
+                         f"({len(diagnostics)} diagnostic(s))")
+    elif root == MATERIAL_SHORTAGE:
+        shortages = _material_shortages(ds)
+        total = sum(s for _, _, _, s in shortages)
+        parts = ", ".join(f"{mid} short {s:.1f}" for mid, _, _, s in shortages)
+        lines.append(
+            f"order-book material demand exceeds on-hand inventory "
+            f"({total:.1f} unit(s) short across {len(shortages)} material(s))"
+            + (f": {parts}" if parts else ""))
+    elif root == EMPLOYEE_SHORTAGE:
+        lines.append(
+            "no qualified and available employee can cover the operations "
+            "that require staff (skill, work-center, shift or availability)")
+    elif root == CAPACITY_SHORTAGE:
+        parts = [
+            f"{mid} needs {ev['required']} min of work but only "
+            f"{ev['available']} working minutes are available"
+            for mid, ev in sorted(capacity.get("machines", {}).items())]
+        agg = capacity.get("aggregate")
+        if agg:
+            parts.append(f"total demand {agg['required']} min exceeds total "
+                         f"machine capacity {agg['available']} min")
+        lines.append("insufficient machine capacity: " + "; ".join(parts))
+    elif root == MAINTENANCE_DOWNTIME:
+        parts = [
+            f"{mid} longest maintenance-free window is "
+            f"{ev['longest_free_window']} min, below operation "
+            f"{ev['operation']} needing {ev['needed']} min"
+            for mid, ev in sorted(maintenance.get("machines", {}).items())]
+        lines.append("maintenance/downtime blocks the machines: "
+                     + "; ".join(parts))
+    elif root == CALENDAR_LIMITATION:
+        lines.append(
+            "the factory calendar / planning horizon does not offer enough "
+            "working time for the operations (slot length, horizon or "
+            "precedence chain)")
+    elif root == SETUP_CHANGEOVER_BURDEN:
+        parts = [
+            f"{mid} processing {ev['processing']} min plus minimum changeover "
+            f"{ev['min_changeover']} min exceeds {ev['available']} min "
+            f"available"
+            for mid, ev in sorted(setup.get("machines", {}).items())]
+        lines.append("setup/changeover overhead makes the workload "
+                     "infeasible: " + "; ".join(parts))
+    else:  # UNKNOWN_INFEASIBILITY
+        lines.append(
+            "no proven root cause: all local eligibility and capacity checks "
+            "pass but the solver found no feasible schedule")
+    if len(ranked) > 1:
+        others = ", ".join(c for c, _ in ranked[1:])
+        lines.append(f"secondary causes: {others}")
+    return lines
+
+
+def analyze_infeasibility(ds: Dataset,
+                          diagnostics: Optional[List[Dict]] = None) -> Dict:
+    """Phase 6 P5 root-cause analysis of an infeasible dataset.
+
+    Consumes the layered diagnostics (computed via ``build_diagnostics`` when
+    not supplied, e.g. the solver's ``SolveResult.diagnostics``) and adds
+    deterministic machine-capacity, maintenance/downtime and
+    setup/changeover evidence, then ranks every detected cause by severity.
+
+    Returns a dict with:
+      status       "INFEASIBLE", or "FEASIBLE" when ``diagnostics`` is empty
+      root_cause   the highest-ranked category (None when FEASIBLE)
+      confidence   HIGH / MEDIUM / LOW, deterministic per category
+      rank         deterministic severity order of the root cause
+      details      concise human-readable lines
+      metrics      supporting evidence (capacity/maintenance/setup/counts)
+      causes       all detected categories sorted by rank
+      diagnostics  the underlying layered diagnostics (unchanged input)
+
+    The API is usable independently of the CLI; it never runs a solver and
+    never modifies its inputs.
+    """
+    horizon = _horizon(ds)
+    if diagnostics is None:
+        diagnostics = build_diagnostics(ds)
+    if not diagnostics:
+        return {
+            "status": "FEASIBLE",
+            "root_cause": None,
+            "confidence": None,
+            "rank": None,
+            "details": ["no infeasibility diagnostics: the dataset is feasible"],
+            "metrics": {},
+            "causes": [],
+            "diagnostics": [],
+        }
+
+    causes: Counter = Counter()
+    for d in diagnostics:
+        code = d.get("code", "")
+        causes[_P4_TO_P5.get(code, STRUCTURAL_INVALIDITY)] += 1
+
+    capacity = _capacity_evidence(ds, horizon)
+    if capacity:
+        causes[CAPACITY_SHORTAGE] += 1
+
+    maintenance = _maintenance_evidence(ds, horizon)
+    if maintenance:
+        causes[MAINTENANCE_DOWNTIME] += 1
+
+    setup = _setup_evidence(ds, horizon)
+    if setup:
+        causes[SETUP_CHANGEOVER_BURDEN] += 1
+
+    # The UNKNOWN fallback is only honest when nothing else was proven.
+    if UNKNOWN_INFEASIBILITY in causes and len(causes) > 1:
+        del causes[UNKNOWN_INFEASIBILITY]
+
+    ranked = sorted(causes.items(), key=lambda kv: _RANK[kv[0]])
+    root = ranked[0][0]
+
+    return {
+        "status": "INFEASIBLE",
+        "root_cause": root,
+        "confidence": _CONFIDENCE[root],
+        "rank": _RANK[root],
+        "details": _describe(root, ranked, ds, diagnostics,
+                             capacity, maintenance, setup),
+        "metrics": {
+            "capacity": capacity,
+            "maintenance": maintenance,
+            "setup": setup,
+            "counts": dict(causes),
+        },
+        "causes": [{"category": c, "count": n, "rank": _RANK[c]}
+                   for c, n in ranked],
+        "diagnostics": diagnostics,
+    }

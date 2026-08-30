@@ -28,15 +28,17 @@ Strategy (documented so the behaviour is predictable and testable):
        * the earliest start honours precedence (start >= previous chain
          operation's end) and the order's release time;
        * machine readiness: no overlap with previous work on the machine, a
-         setup gap of ``op.setup_time`` after the machine's previous
-         operation and after every maintenance / downtime window;
+         changeover gap after the machine's previous operation
+         (``changeover(prev, op)``: the setup-matrix value when both
+         operations carry a ``setup_family_id`` and the dataset defines a
+         ``setup_matrix``, else the operation's ``setup_time``) and after
+         every maintenance / downtime window (the operation's ``setup_time``);
        * calendar: the operation fits entirely inside one working shift slot;
        * employee: the first (sorted id) eligible employee whose shifts match
          the slot, whose availability window contains the operation, and who
          has no overlapping prior work.
-     Sequence-dependent setup matrices are out of scope here (Phase 4
-     territory); the machine gap uses ``op.setup_time`` exactly as the
-     validator checks it.
+     No sequence optimization is performed: the changeover values are respected
+     as hard gaps, never traded against the objective.
 
   4. Result. When every operation of every order is placed the result is a
      complete, validator-clean schedule with status FEASIBLE (a heuristic,
@@ -55,7 +57,7 @@ from typing import Dict, List, Optional, Tuple
 
 from ortools.sat.python import cp_model
 
-from aps_engine.models import Dataset, Operation
+from aps_engine.models import Dataset, Operation, changeover
 from aps_engine.solver.model import SolveResult
 
 
@@ -94,17 +96,21 @@ def _windows_of(ds: Dataset, mid: str) -> List[Tuple[int, int]]:
 def _machine_ready(ds: Dataset, op: Operation, mid: str,
                    windows: List[Tuple[int, int]], start_after: int,
                    machine_free: Dict[str, int],
-                   machine_used: Dict[str, bool]) -> int:
+                   machine_last_op: Dict[str, Optional[Operation]]) -> int:
     """Earliest window-free start ``>= start_after`` on machine ``mid``.
 
-    Respects the setup gap after the machine's previous operation
-    (``op.setup_time``) and after every maintenance / downtime window: the
+    Respects the changeover gap after the machine's previous operation
+    (``changeover(ds, prev, op)``: the setup-matrix value when both operations
+    carry a ``setup_family_id`` and the dataset defines a ``setup_matrix``,
+    else the operation's ``setup_time``) and after every maintenance /
+    downtime window (``op.setup_time``, i.e. ``changeover(window, op)``): the
     region [start - setup, start + processing) must never overlap a window.
     """
     setup = op.setup_time
+    prev = machine_last_op[mid]
     start = start_after
-    if machine_used[mid]:
-        start = max(start, machine_free[mid] + setup)
+    if prev is not None:
+        start = max(start, machine_free[mid] + changeover(ds, prev, op))
     while True:
         pushed = False
         for ws, we in windows:
@@ -144,7 +150,7 @@ def _pick_employee(ds: Dataset, op: Operation, sid: Optional[str],
 def _place_operation(ds: Dataset, op: Operation, slots,
                      windows_by_machine: Dict[str, List[Tuple[int, int]]],
                      machine_free: Dict[str, int],
-                     machine_used: Dict[str, bool],
+                     machine_last_op: Dict[str, Optional[Operation]],
                      employee_free: Dict[str, int],
                      earliest_base: int
                      ) -> Optional[Tuple[str, int, int, Optional[str]]]:
@@ -159,7 +165,7 @@ def _place_operation(ds: Dataset, op: Operation, slots,
         for sid, s0, s1 in slots:
             cand = _machine_ready(ds, op, mid, windows,
                                   max(earliest_base, s0),
-                                  machine_free, machine_used)
+                                  machine_free, machine_last_op)
             if cand + op.processing_time > s1:
                 continue  # does not fit inside this working slot
             if not op.employee_required:
@@ -185,7 +191,7 @@ def greedy_solve(dataset: Dataset) -> Dict:
     slots = _working_slots(ds)
     windows_by_machine = {mid: _windows_of(ds, mid) for mid in ds.machines}
     machine_free: Dict[str, int] = {mid: 0 for mid in ds.machines}
-    machine_used: Dict[str, bool] = {mid: False for mid in ds.machines}
+    machine_last_op: Dict[str, Optional[Operation]] = {mid: None for mid in ds.machines}
     employee_free: Dict[str, int] = {eid: 0 for eid in ds.employees}
 
     orders = sorted(ds.orders.values(),
@@ -211,7 +217,7 @@ def greedy_solve(dataset: Dataset) -> Dict:
         order_end = chain_end
         for op in ds.operations_of_order(order.id):
             placed = _place_operation(
-                ds, op, slots, windows_by_machine, machine_free, machine_used,
+                ds, op, slots, windows_by_machine, machine_free, machine_last_op,
                 employee_free, max(order.release_time, order_end))
             if placed is None:
                 failures.append(
@@ -227,7 +233,7 @@ def greedy_solve(dataset: Dataset) -> Dict:
                 "end": end,
             }
             machine_free[mid] = end
-            machine_used[mid] = True
+            machine_last_op[mid] = op
             if eid is not None:
                 employee_free[eid] = end
             order_end = end

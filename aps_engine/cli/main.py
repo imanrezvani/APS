@@ -1,8 +1,9 @@
-"""Phase 5 CLI: generate -> build -> solve -> extract -> validate -> report.
+"""APS Engine CLI: generate -> build -> solve -> extract -> validate -> report.
 
 Feasible runs print the schedule, the validation report, and the read-only
-order-book material feasibility report, then exit 0. Infeasible runs print
-the feasibility diagnostics and exit 1.
+order-book material feasibility report, then exit 0. Infeasible runs print the
+root cause (Phase 6 P5 root-cause analysis) followed by the layered feasibility
+diagnostics and exit 1.
 `python -m aps_engine --infeasible` solves a deterministic infeasible
 dataset (used by the E2E tests to exercise the diagnostics path) and
 `python -m aps_engine --material-feasible` uses the material-feasible
@@ -16,13 +17,20 @@ from collections import Counter
 from typing import Dict, List, Optional, Tuple
 
 from aps_engine.generator import generate_dataset, generate_infeasible_dataset
+from aps_engine.models import changeover
+from aps_engine.solver.diagnostics import analyze_infeasibility
 from aps_engine.solver.model import SolverParams
 from aps_engine.solver.solver import solve
 from aps_engine.validation.validator import validate
 
 
 def _setup_summary(ds, schedule) -> Tuple[int, int]:
-    """Count machine changeovers and total setup minutes in the schedule."""
+    """Count machine changeovers and total setup minutes in the schedule.
+
+    Uses the shared ``changeover(prev, nxt)`` so sequence-dependent setup
+    matrices are reflected; without setup families this is exactly the
+    following operation's ``setup_time`` (unchanged behaviour).
+    """
     ops_by_machine: Dict[str, List[Tuple[int, int, str]]] = {}
     for o in schedule["operations"]:
         if o["machine_id"]:
@@ -33,10 +41,12 @@ def _setup_summary(ds, schedule) -> Tuple[int, int]:
     for intervals in ops_by_machine.values():
         intervals.sort(key=lambda x: x[0])
         for a in range(len(intervals) - 1):
+            prev = ds.operations[intervals[a][2]]
             nxt = ds.operations[intervals[a + 1][2]]
-            if nxt.setup_time > 0:
+            value = changeover(ds, prev, nxt)
+            if value > 0:
                 changeovers += 1
-                setup_minutes += nxt.setup_time
+                setup_minutes += value
     return changeovers, setup_minutes
 
 
@@ -109,6 +119,10 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if not result.feasible:
         print("\nNo feasible solution found. Validation skipped.")
+        analysis = analyze_infeasibility(ds, result.diagnostics)
+        print(f"\nRoot cause: {analysis['root_cause']}")
+        for line in analysis["details"]:
+            print(f"    {line}")
         _print_diagnostics(result.diagnostics)
         return 1
 
