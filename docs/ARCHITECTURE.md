@@ -47,9 +47,28 @@ integer minutes since the start of day 0.
   sequence-dependent changeover gap; each pair is gated on the `on_im`
   literals of the operations involved.
 - `solver.py` — thin orchestration: build -> solve -> extract.
+- `greedy.py` — deterministic greedy reference scheduler (`greedy_solve`):
+  mirrors the CP-SAT feasibility model (machines, calendar, maintenance,
+  employees, materials, sequence-dependent setup) by scheduling orders one at a
+  time; returns the same `SolveResult` shape and objective metric, never claims
+  optimality. Used as an independent cross-check via `aps_engine.benchmarks`.
 - `diagnostics.py` — layered infeasibility diagnostics run only when CP-SAT
   reports INFEASIBLE; never modifies constraints; falls back to
-  `GLOBAL_SCHEDULING_CONFLICT`.
+  `GLOBAL_SCHEDULING_CONFLICT`. `analyze_infeasibility(ds, diagnostics=None)`
+  is a deterministic root-cause layer on top: it consumes the layered
+  diagnostics plus machine-capacity, maintenance/downtime and setup/changeover
+  evidence and ranks the detected causes into one root cause
+  (`MATERIAL_SHORTAGE`, `CAPACITY_SHORTAGE` / `MACHINE_CAPACITY`,
+  `EMPLOYEE_SHORTAGE`, `CALENDAR_LIMITATION`, `MAINTENANCE_DOWNTIME`,
+  `SETUP_CHANGEOVER_BURDEN`, `STRUCTURAL_INVALIDITY`, `UNKNOWN_INFEASIBILITY`).
+
+## Benchmarks (`aps_engine/benchmarks/`)
+
+`comparison.py` runs `solve` and `greedy_solve` on the same `Dataset`
+(`python -m aps_engine.benchmarks`) and reports status, objective, wall time,
+operations scheduled and independent validity for each, plus an
+`objective_delta` when both solvers produce an objective. Neither solver may
+mutate the Dataset.
 
 ## Validator (`aps_engine/validation/validator.py`)
 
@@ -87,9 +106,11 @@ Pipeline: generate -> build -> solve -> extract -> validate -> report.
 Exit 0 on feasible/valid, exit 1 on infeasible or invalid. Prints orders,
 operations, employee counts, validation report (including a
 material (MATERIAL_VIOLATION) count), a changeover/setup summary, and the
-read-only `[8] MATERIAL FEASIBILITY` report. `--infeasible` solves the
-deterministic infeasible dataset; `--material-feasible` uses the
-material-feasible dataset variant.
+read-only `[8] MATERIAL FEASIBILITY` report. On infeasible runs the CLI prints
+`Root cause: <CAUSE>` (from `analyze_infeasibility`) plus concise details
+before the layered feasibility diagnostics, and still exits 1.
+`--infeasible` solves the deterministic infeasible dataset; `--material-feasible`
+uses the material-feasible dataset variant.
 
 ## Data flow
 
@@ -100,7 +121,10 @@ generator.generate_dataset()
   -> builder.solve()               (CP-SAT, 30s limit, seed 42)
   -> extract_schedule()            (operations/orders/objective)
   -> validator.validate()          (independent re-check)
-  -> CLI report / exit code
+  -> CLI report / exit code        (infeasible: Root cause via analyze_infeasibility)
+
+greedy_solve(Dataset)              (deterministic reference; same validator)
+  -> benchmark harness compares against solve() without mutating the Dataset
 ```
 
 ## Major constraints (solver/model.py)

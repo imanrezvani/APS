@@ -1,4 +1,4 @@
-# APS Engine — Phase 5 Setup & Changeover
+# APS Engine — Phase 6 Reference Scheduler, Setup Families & Diagnostics
 
 A minimal but correct CP-SAT production scheduler for a wood-panel / furniture
 factory. Phase 5 adds machine setup (changeover) times on top of the Phase 4
@@ -10,16 +10,23 @@ materials (BOM) backed by a read-only inventory model, and since Phase 5 the
 solver enforces time-phased material availability while the independent
 validator re-derives material consumption from the schedule.
 
+Phase 6 adds a deterministic greedy reference scheduler and a benchmark harness
+(`solve` vs `greedy_solve`), makes the setup gap sequence-dependent through
+per-product setup families plus a global `setup_matrix` (single source of truth
+`changeover()`), and adds a deterministic feasibility root-cause analysis
+(`analyze_infeasibility`) on top of the layered diagnostics, printed as
+`Root cause: <CAUSE>` by the CLI.
+
 ## Scope
 
-Phase 5 enforces:
+The engine enforces:
 
 | Constraint                 | Enforced |
 |----------------------------|----------|
 | Operation precedence       | yes      |
 | Machine compatibility      | yes      |
 | Machine capacity           | yes (NoOverlap) |
-| Machine setup / changeover | yes (gap >= setup_time of the following operation) |
+| Machine setup / changeover | yes (gap >= `changeover()` value; sequence-dependent with setup families) |
 | Order release time         | yes      |
 | Factory calendar           | yes (each operation fits inside one shift; no holidays) |
 | Maintenance / downtime     | yes (fixed NoOverlap windows) |
@@ -69,6 +76,29 @@ consecutive operations on a machine are checked with the `SETUP_VIOLATION`
 code. Setup-induced infeasibility is a global scheduling conflict and, like
 other unprovable combinations, is reported as `GLOBAL_SCHEDULING_CONFLICT` by
 the diagnostics layer.
+
+Since Phase 6 the setup gap may be sequence-dependent: each product carries an
+optional `setup_family_id` and the dataset a global `setup_matrix`
+(`{(from_family, to_family): minutes}`). The gap between two consecutive
+activities on a machine is `changeover(ds, prev, nxt)` — the matrix value when
+both operations have families and a matrix entry exists, otherwise the
+following operation's `setup_time` (`any -> window` is 0, `window -> op` is the
+operation's `setup_time`). Without setup families the behavior is identical to
+the sequence-independent case, so Phase 1-5 datasets behave exactly as before.
+`changeover()` is the single source of truth shared by the CP-SAT model, the
+independent validator and the CLI setup summary.
+
+## Reference scheduler & benchmark
+
+`solver/greedy.py` provides a deterministic greedy reference scheduler
+(`greedy_solve`) that mirrors the CP-SAT feasibility model (machines, calendar,
+maintenance, employees, materials, sequence-dependent setup) by scheduling
+orders one at a time. It returns the same `SolveResult` shape and objective
+metric as CP-SAT but never claims optimality — it is an independent cross-check
+checked by the same validator. `aps_engine.benchmarks`
+(`python -m aps_engine.benchmarks`) runs `solve` and `greedy_solve` on the same
+Dataset and reports status, objective, wall time, operations scheduled and
+independent validity for each, asserting neither solver mutates the Dataset.
 
 ## Employees
 
@@ -122,9 +152,11 @@ aps_engine/
     generator/generator.py# deterministic synthetic dataset (seed=42)
     solver/model.py       # CP-SAT model + extraction
     solver/solver.py      # solve() orchestration
-    solver/diagnostics.py # infeasibility diagnostics (Phase 4)
+    solver/greedy.py      # deterministic greedy reference scheduler
+    solver/diagnostics.py # infeasibility diagnostics (Phase 4) + root-cause analysis (Phase 6 P5)
     validation/pre_solve.py  # pre-solve structural validation (Phase 4)
     validation/validator.py  # independent post-solve validator
+    benchmarks/           # benchmark harness (solve vs greedy_solve)
     cli/main.py           # CLI entry
     tests/
     test_generator.py
@@ -157,6 +189,19 @@ path:
 
 ```bash
 python -m aps_engine --infeasible
+```
+
+Solve the material-feasible variant of the same dataset (solves to OPTIMAL
+39.0, `valid: True violations: 0`, and exits 0):
+
+```bash
+python -m aps_engine --material-feasible
+```
+
+Compare the CP-SAT solver against the greedy reference scheduler:
+
+```bash
+python -m aps_engine.benchmarks
 ```
 
 Run the tests:
@@ -207,6 +252,17 @@ root cause is proven,
 the honest answer is `GLOBAL_SCHEDULING_CONFLICT`. Constraints are never
 weakened to produce a diagnosis. Feasible runs have `diagnostics = []`.
 
+Phase 6 adds a deterministic root-cause layer on top:
+`solver/diagnostics.py.analyze_infeasibility(ds, diagnostics)` consumes the
+layered diagnostics plus additional evidence (machine capacity,
+maintenance/downtime windows, minimum setup/changeover overhead) and ranks the
+detected causes into a single root cause with a deterministic severity order:
+`MATERIAL_SHORTAGE`, `CAPACITY_SHORTAGE` / `MACHINE_CAPACITY`,
+`EMPLOYEE_SHORTAGE`, `CALENDAR_LIMITATION`, `MAINTENANCE_DOWNTIME`,
+`SETUP_CHANGEOVER_BURDEN`, `STRUCTURAL_INVALIDITY`, `UNKNOWN_INFEASIBILITY`.
+The CLI prints `Root cause: <CAUSE>` plus concise details on infeasible runs,
+before the existing layered diagnostics.
+
 ## Acceptance gate
 
 - machine setup / changeover constraint (solver + independent validator)
@@ -219,6 +275,14 @@ weakened to produce a diagnosis. Feasible runs have `diagnostics = []`.
 - material-feasible dataset solves to OPTIMAL 39.0; material-short dataset is
   INFEASIBLE with MATERIAL_SHORTAGE diagnostics; validator flags material
   over-consumption with MATERIAL_VIOLATION details
-- Phase 1, Phase 2, Phase 3, Phase 4 and Phase 5 tests pass
+- sequence-dependent setup families via `changeover()` (solver + validator +
+  CLI setup summary); `setup_time = 0` preserves Phase 1-4 behaviour
+- deterministic greedy reference scheduler agrees with CP-SAT on feasibility
+  and passes the same independent validator
+- benchmark harness reports solver vs greedy status, objective, wall time and
+  validity without mutating the Dataset
+- infeasible runs print a deterministic `Root cause: <CAUSE>` before the
+  layered diagnostics
+- Phase 1 through Phase 6 tests pass
 - solver schedule passes validator
 - CLI runs successfully

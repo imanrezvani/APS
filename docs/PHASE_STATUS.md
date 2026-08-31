@@ -21,6 +21,7 @@
 | Phase 5 P3 — independent material validation + CLI/docs | COMPLETE |
 | Phase 6 P1 — deterministic greedy reference scheduler | COMPLETE |
 | Phase 6 P2 — benchmark harness (`solve` vs `greedy_solve`) | COMPLETE |
+| Phase 6 P3 — documentation & housekeeping reconciliation | COMPLETE |
 | Phase 6 P4 — sequence-dependent setup / changeover | COMPLETE |
 | Phase 6 P5 — feasibility root-cause diagnostics | COMPLETE |
 
@@ -117,6 +118,14 @@ model, implemented through the standard staged workflow.
   same Dataset and reports status, objective, wall time, operations scheduled
   and independent validity for each, asserting neither solver mutates the
   Dataset. Tests in `tests/test_benchmark.py`.
+- **P3 (complete)** — documentation & housekeeping reconciliation: `README.md`
+  and `docs/ARCHITECTURE.md` updated to cover the Phase 6 surface (greedy
+  reference scheduler, benchmark harness, sequence-dependent setup families /
+  `changeover()`, feasibility root-cause analysis) and the CLI module docstring
+  moved to a phase-neutral "APS Engine CLI". Git hygiene: `.gitignore`
+  added (`__pycache__/`, `*.py[cod]`) and all previously tracked
+  `__pycache__`/`.pyc` artifacts removed from the index. No solver, model,
+  validator or generator behavior changed.
 - **P4 (complete)** — sequence-dependent setup / changeover: `changeover()`
   is the single source of truth shared by the CP-SAT model, the validator and
   the CLI setup summary. `generate_dataset(sequence_dependent_setup=True)`
