@@ -1,4 +1,4 @@
-# APS Engine — Phase 6 Reference Scheduler, Setup Families & Diagnostics
+# APS Engine — Phase 7 Objective Layer
 
 A minimal but correct CP-SAT production scheduler for a wood-panel / furniture
 factory. Phase 5 adds machine setup (changeover) times on top of the Phase 4
@@ -16,6 +16,12 @@ per-product setup families plus a global `setup_matrix` (single source of truth
 `changeover()`), and adds a deterministic feasibility root-cause analysis
 (`analyze_infeasibility`) on top of the layered diagnostics, printed as
 `Root cause: <CAUSE>` by the CLI.
+
+Phase 7 makes the solver objective pluggable: the objective is extracted from
+`ModelBuilder` into a registry (`aps_engine.objectives`) of builder callables,
+with `weighted_tardiness` as the default and a deterministic `makespan`
+alternative, selectable through `SolverParams.objective` or the CLI
+`--objective` flag.
 
 ## Scope
 
@@ -37,9 +43,17 @@ The engine enforces:
 | Employee availability      | yes (available_from <= start, end <= available_until) |
 | Employee capacity          | yes (NoOverlap on employee intervals) |
 | Material availability      | yes (time-phased cumulative working stock, Phase 5) |
-| Due date                   | soft → weighted tardiness objective |
+| Due date                   | soft → objective (default weighted tardiness) |
 
-Objective (single): `minimize sum(order.priority * tardiness(order))`
+## Objective
+
+The solver objective is pluggable through `aps_engine/objectives` — a registry
+that maps objective names to builder callables. `ModelBuilder` delegates
+objective construction via `SolverParams.objective` (default
+`weighted_tardiness`). Registered objectives:
+
+- `weighted_tardiness` (default): `minimize sum(order.priority * tardiness(order))`
+- `makespan`: `minimize max(end_time over all operations)`
 
 ## Factory calendar
 
@@ -154,6 +168,7 @@ aps_engine/
     solver/solver.py      # solve() orchestration
     solver/greedy.py      # deterministic greedy reference scheduler
     solver/diagnostics.py # infeasibility diagnostics (Phase 4) + root-cause analysis (Phase 6 P5)
+    objectives/           # pluggable objective registry (weighted_tardiness, makespan)
     validation/pre_solve.py  # pre-solve structural validation (Phase 4)
     validation/validator.py  # independent post-solve validator
     benchmarks/           # benchmark harness (solve vs greedy_solve)
@@ -196,6 +211,15 @@ Solve the material-feasible variant of the same dataset (solves to OPTIMAL
 
 ```bash
 python -m aps_engine --material-feasible
+```
+
+Select the solver objective (default `weighted_tardiness`; `makespan` is the
+only other registered objective). The material-feasible variant solves to
+OPTIMAL 39.0 under weighted tardiness and OPTIMAL 1350.0 under makespan:
+
+```bash
+python -m aps_engine --material-feasible --objective weighted_tardiness
+python -m aps_engine --material-feasible --objective makespan
 ```
 
 Compare the CP-SAT solver against the greedy reference scheduler:
@@ -283,6 +307,13 @@ before the existing layered diagnostics.
   validity without mutating the Dataset
 - infeasible runs print a deterministic `Root cause: <CAUSE>` before the
   layered diagnostics
-- Phase 1 through Phase 6 tests pass
+- pluggable objective registry (`weighted_tardiness` default, `makespan`
+  registered); extracted builder reproduces the original objective exactly
+  (material-feasible OPTIMAL 39.0)
+- makespan solves the material-feasible dataset to OPTIMAL 1350.0 and is
+  deterministic in objective value across repeated runs
+- CLI `--objective` selects the objective and fails cleanly on invalid values
+  (exit 1); default CLI output, exit codes and objective 39.0 are unchanged
+- Phase 1 through Phase 7 tests pass
 - solver schedule passes validator
 - CLI runs successfully

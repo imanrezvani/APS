@@ -7,7 +7,9 @@ diagnostics and exit 1.
 `python -m aps_engine --infeasible` solves a deterministic infeasible
 dataset (used by the E2E tests to exercise the diagnostics path) and
 `python -m aps_engine --material-feasible` uses the material-feasible
-dataset variant (Phase 4.7).
+dataset variant (Phase 4.7). `--objective <name>` selects the solver
+objective through the registry (Phase 7 P3); it defaults to
+`weighted_tardiness` and `makespan` is the only other registered objective.
 """
 
 from __future__ import annotations
@@ -18,10 +20,32 @@ from typing import Dict, List, Optional, Tuple
 
 from aps_engine.generator import generate_dataset, generate_infeasible_dataset
 from aps_engine.models import changeover
+from aps_engine.objectives import get_objective, registered_objectives
 from aps_engine.solver.diagnostics import analyze_infeasibility
 from aps_engine.solver.model import SolverParams
 from aps_engine.solver.solver import solve
 from aps_engine.validation.validator import validate
+
+_OBJECTIVE_LABELS = {
+    "weighted_tardiness": "weighted tardiness",
+    "makespan": "makespan",
+}
+
+
+def _parse_objective(args: List[str]) -> str:
+    """Return the objective from ``--objective <name>`` (or ``--objective=<name>``).
+
+    Defaults to ``weighted_tardiness`` when the flag is absent.
+    """
+    for i, arg in enumerate(args):
+        if arg == "--objective":
+            if i + 1 >= len(args):
+                raise ValueError(
+                    "--objective requires a value (weighted_tardiness|makespan)")
+            return args[i + 1]
+        if arg.startswith("--objective="):
+            return arg.split("=", 1)[1]
+    return "weighted_tardiness"
 
 
 def _setup_summary(ds, schedule) -> Tuple[int, int]:
@@ -85,6 +109,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     use_infeasible = "--infeasible" in args
     use_material_feasible = "--material-feasible" in args
 
+    try:
+        objective = _parse_objective(args)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    try:
+        get_objective(objective)
+    except KeyError:
+        valid = ", ".join(registered_objectives())
+        print(f"ERROR: unknown objective {objective!r} (valid: {valid})", file=sys.stderr)
+        return 1
+
     print("=" * 64)
     print("APS ENGINE - PHASE 5 SETUP & CHANGEOVER")
     print("=" * 64)
@@ -106,13 +142,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"    skills={len(ds.skills)} employees={len(ds.employees)}")
 
     print("\n[2] Building CP-SAT model ...")
-    params = SolverParams(time_limit_seconds=30, num_search_workers=2, random_seed=42)
+    params = SolverParams(time_limit_seconds=30, num_search_workers=2,
+                          random_seed=42, objective=objective)
     out = solve(ds, params)
     result = out["result"]
 
     print("\n[3] Solving ...")
     print(f"    STATUS: {result.status}")
-    print(f"    OBJECTIVE (weighted tardiness): {result.objective_value}")
+    label = _OBJECTIVE_LABELS.get(objective, objective)
+    print(f"    OBJECTIVE ({label}): {result.objective_value}")
     print(f"    best bound: {result.best_bound}")
     print(f"    solve time: {result.wall_time:.2f}s")
     print(f"    conflicts: {result.num_conflicts}  branches: {result.num_branches}")

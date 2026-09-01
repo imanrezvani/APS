@@ -61,6 +61,27 @@ integer minutes since the start of day 0.
   (`MATERIAL_SHORTAGE`, `CAPACITY_SHORTAGE` / `MACHINE_CAPACITY`,
   `EMPLOYEE_SHORTAGE`, `CALENDAR_LIMITATION`, `MAINTENANCE_DOWNTIME`,
   `SETUP_CHANGEOVER_BURDEN`, `STRUCTURAL_INVALIDITY`, `UNKNOWN_INFEASIBILITY`).
+- Objective: `ModelBuilder._objective()` delegates through
+  `SolverParams.objective` to the objective registry (Phase 7); see
+  "Objectives" below.
+
+## Objectives (`aps_engine/objectives/`)
+
+Pluggable objective layer (Phase 7). `aps_engine/objectives` is a registry
+mapping objective names to builder callables (`get_objective(name)`,
+`registered_objectives()`); `ModelBuilder` calls the resolved builder from
+`_objective()`, so the objective no longer lives inline in the model.
+
+- `weighted_tardiness` (default, `SolverParams.objective =
+  "weighted_tardiness"`) — the original single objective: minimize
+  `sum(order.priority * tardiness(order))`, one `tard_*` variable per order
+  (recorded on `builder.tardiness`).
+- `makespan` — minimize `max(end_time over all operations)` via a
+  `makespan` variable equal to `AddMaxEquality` over `builder.end_i`
+  (recorded on `builder.makespan_var`).
+
+Both builders reuse the existing `ModelBuilder` variables and add no extra
+constraint logic.
 
 ## Benchmarks (`aps_engine/benchmarks/`)
 
@@ -110,14 +131,20 @@ read-only `[8] MATERIAL FEASIBILITY` report. On infeasible runs the CLI prints
 `Root cause: <CAUSE>` (from `analyze_infeasibility`) plus concise details
 before the layered feasibility diagnostics, and still exits 1.
 `--infeasible` solves the deterministic infeasible dataset; `--material-feasible`
-uses the material-feasible dataset variant.
+uses the material-feasible dataset variant; `--objective <name>` selects the
+solver objective through the registry (default `weighted_tardiness`), validating
+the value against `registered_objectives()` and exiting 1 with a clear error on
+unknown or missing values. The `[3] SOLVING` section prints the selected
+objective (e.g. `OBJECTIVE (weighted tardiness):` or `OBJECTIVE (makespan):`).
 
 ## Data flow
 
 ```
+CLI --objective <name> -> SolverParams(objective=name)
 generator.generate_dataset()
   -> Dataset
   -> ModelBuilder.build()          (adds all CP-SAT constraints)
+       -> _objective()             (get_objective(name)(builder) adds objective)
   -> builder.solve()               (CP-SAT, 30s limit, seed 42)
   -> extract_schedule()            (operations/orders/objective)
   -> validator.validate()          (independent re-check)
@@ -143,7 +170,11 @@ greedy_solve(Dataset)              (deterministic reference; same validator)
    `AddCumulative` <= on-hand at every instant (scaled x100).
 10. Due date: soft, via the objective.
 
-## Current objective
+## Objectives at a glance
 
-Single objective, minimize `sum(order.priority * tardiness(order))`, where
-`tardiness = max(0, end(last_op) - due_time)`.
+The objective is selected by `SolverParams.objective` (default
+`weighted_tardiness`) and resolved through the `aps_engine/objectives`
+registry. Weighted tardiness minimizes `sum(order.priority * tardiness(order))`
+with `tardiness = max(0, end(last_op) - due_time)`; makespan minimizes
+`max(end_time over all operations)`. Both are single-objective, deterministic
+and add no extra constraints.

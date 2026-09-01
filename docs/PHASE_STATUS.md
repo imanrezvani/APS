@@ -24,6 +24,10 @@
 | Phase 6 P3 — documentation & housekeeping reconciliation | COMPLETE |
 | Phase 6 P4 — sequence-dependent setup / changeover | COMPLETE |
 | Phase 6 P5 — feasibility root-cause diagnostics | COMPLETE |
+| Phase 7 P1 — objective extraction (pluggable objective registry) | COMPLETE |
+| Phase 7 P2 — makespan objective | COMPLETE |
+| Phase 7 P3 — CLI objective selection (`--objective`) | COMPLETE |
+| Phase 7 P4 — documentation & housekeeping reconciliation | COMPLETE |
 
 ## Current state
 
@@ -48,10 +52,17 @@
   capacity, employee, calendar, maintenance/downtime, setup/changeover,
   structural, unknown) into a single deterministic root cause. The CLI prints
   `Root cause: <CAUSE>` on infeasible runs and still exits 1.
+- The objective is pluggable (Phase 7): `aps_engine/objectives` is a registry
+  mapping objective names to builder callables. `ModelBuilder` delegates
+  objective construction through `SolverParams.objective` (default
+  `weighted_tardiness`). Registered objectives: `weighted_tardiness`
+  (`min sum(order.priority * tardiness(order))`, the original single
+  objective) and `makespan` (`min max(end_time over all operations)`). The
+  CLI selects the objective with `--objective <name>`.
 
 ## Tests / status
 
-- Full suite: **298 passed, 0 failed, 0 skipped** (`python -m pytest`).
+- Full suite: **315 passed, 0 failed, 0 skipped** (`python -m pytest`).
 - Coverage: generator 9, validator 24, solver 20, setup 9, diagnostics 10,
   pre-solve 17, CLI E2E 2, sequence-dependent setup 24, material + BOM 13,
   inventory 11, BOM integration 17, material requirements 20,
@@ -59,7 +70,8 @@
   order-book material feasibility 8, pre-solve materials 10, material demand 9,
   material-feasible scenario 8, CLI material report 5, generator setup
   families 5, greedy 15, benchmark 7, CLI setup summary 2, feasibility
-  diagnostics 16, validator material 6.
+  diagnostics 16, validator material 6, objectives 7, makespan 5, CLI
+  objective 5.
 - Regression: `test_operation_assigned_elsewhere_not_constrained_by_candidate_pair`
   proves an op assigned to another machine is not constrained by an unselected
   machine's changeover (PANEL->FLAT = 100000, both ops still start at 480).
@@ -70,6 +82,14 @@
   26 changeovers / 370 setup minutes.
 - CLI (`python -m aps_engine --infeasible`): exit 1, `STATUS: INFEASIBLE`,
   `Root cause: EMPLOYEE_SHORTAGE`.
+- CLI (`python -m aps_engine --material-feasible --objective weighted_tardiness`):
+  exit 0, `STATUS: OPTIMAL`, `OBJECTIVE (weighted tardiness): 39.0`,
+  `valid: True violations: 0` (same as the default objective).
+- CLI (`python -m aps_engine --material-feasible --objective makespan`):
+  exit 0, `STATUS: OPTIMAL`, `OBJECTIVE (makespan): 1350.0`,
+  `valid: True violations: 0`; makespan is deterministic across repeated runs.
+- CLI invalid objective (`--objective bogus`): exit 1, stderr
+  `ERROR: unknown objective 'bogus' (valid: makespan, weighted_tardiness)`.
 - Family-enabled consistency
   (`generate_dataset(sequence_dependent_setup=True, material_feasible=True)`):
   cp-sat OPTIMAL 39.0 / valid; greedy FEASIBLE 11550.0 / valid; feasibility
@@ -144,6 +164,34 @@ model, implemented through the standard staged workflow.
   UNKNOWN_INFEASIBILITY. The CLI prints `Root cause: <CAUSE>` plus concise
   details on infeasible runs; existing diagnostics output and exit codes are
   unchanged. Tests in `tests/test_feasibility_diagnostics.py`.
+
+**Phase 7 — objective layer** (COMPLETE).
+
+- **P1 (complete)** — objective extraction: the hardcoded weighted-tardiness
+  objective is extracted from `ModelBuilder._objective()` into
+  `aps_engine/objectives/` as a pluggable registry (`get_objective`,
+  `registered_objectives`) with `weighted_tardiness` as the sole, default
+  entry. `SolverParams.objective` (default `"weighted_tardiness"`) threads the
+  selection through `ModelBuilder`. Behaviour is identical (material-feasible
+  dataset still solves to OPTIMAL 39.0). Tests in
+  `tests/test_objectives.py`.
+- **P2 (complete)** — makespan objective: `aps_engine/objectives/makespan.py`
+  minimizes `max(end_time over all operations)` via a `makespan` variable
+  recorded on `builder.makespan_var`. Registered as `"makespan"`; weighted
+  tardiness stays the default. Solving the material-feasible dataset with
+  makespan is OPTIMAL (objective 1350.0), deterministic in objective value
+  across repeated runs, and passes the independent validator. Tests in
+  `tests/test_makespan.py`.
+- **P3 (complete)** — CLI objective selection: `python -m aps_engine
+  --objective <name>` validates the value against the registry and threads it
+  through `SolverParams`. Invalid values fail cleanly (`ERROR: unknown
+  objective '<name>' (valid: makespan, weighted_tardiness)`, exit 1) and a
+  missing value reports `--objective requires a value`. All existing output,
+  exit codes and defaults are unchanged. Tests in `tests/test_cli_objective.py`.
+- **P4 (complete)** — documentation & housekeeping reconciliation: this file,
+  `README.md` and `docs/ARCHITECTURE.md` updated to cover the Phase 7
+  objective layer; test count and CLI verification recorded; all Phase 7 work
+  committed. No solver, model, validator, generator or CLI behaviour changed.
 
 ## Next planned phase
 

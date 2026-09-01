@@ -47,6 +47,7 @@ from typing import Dict, List, Optional, Tuple
 from ortools.sat.python import cp_model
 
 from aps_engine.models import Dataset, Operation, changeover
+from aps_engine.objectives import get_objective
 from aps_engine.solver.diagnostics import build_diagnostics
 
 
@@ -56,6 +57,7 @@ class SolverParams:
     num_search_workers: int = 2
     random_seed: int = 42
     log_search_progress: bool = False
+    objective: str = "weighted_tardiness"
 
 
 class ModelBuilder:
@@ -74,6 +76,7 @@ class ModelBuilder:
         self.end_i: Dict[str, cp_model.IntVar] = {}
         self.machine_ops: Dict[str, List[str]] = {}
         self.tardiness: Dict[str, cp_model.IntVar] = {}
+        self.makespan_var: Optional[cp_model.IntVar] = None
         # shift slots derived from the factory calendar:
         # (day_index, shift_id, start_abs, end_abs)
         self.slots: List[Tuple[int, str, int, int]] = []
@@ -359,15 +362,7 @@ class ModelBuilder:
                 m.AddCumulative(intervals, demands, capacity)
 
     def _objective(self) -> None:
-        m = self.model
-        terms = []
-        for order_id, order in self.ds.orders.items():
-            last = self.ds.routings[order_id].operations[-1]
-            tard = m.NewIntVar(0, self.horizon_end, f"tard_{order_id}")
-            m.AddMaxEquality(tard, [0, self.end_i[last] - order.due_time])
-            self.tardiness[order_id] = tard
-            terms.append(order.priority * tard)
-        m.Minimize(sum(terms))
+        get_objective(self.p.objective)(self)
 
     # ------------------------------------------------------------------ solve
     def solve(self) -> "SolveResult":
