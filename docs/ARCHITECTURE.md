@@ -91,6 +91,41 @@ operations scheduled and independent validity for each, plus an
 `objective_delta` when both solvers produce an objective. Neither solver may
 mutate the Dataset.
 
+## IO layer (`aps_engine/io/`)
+
+Phase 8 JSON persistence over the existing domain and solve structures. No
+domain dataclass changes; no database.
+
+- `dataset_io.py` — `dataset_to_json(dataset)` serializes a `Dataset` into a
+  versioned document (`format: "aps-engine.dataset.v1"`) and
+  `dataset_from_json(data)` rebuilds it losslessly from a JSON string or a
+  parsed dict. Every entity is stored via `dataclasses.asdict` and rebuilt by
+  constructor keyword; `setup_matrix` tuple keys `(from_family, to_family)`
+  are encoded as explicit `[from, to, minutes]` triples (dict insertion order
+  is preserved, so sequence-dependent datasets round-trip exactly).
+- `result_io.py` — `result_to_json(output)` / `result_from_json(data)`
+  round-trip a solve output as a versioned document
+  (`format: "aps-engine.result.v1"`) with the real `SolveResult` fields
+  (status, `status_code` stored as int and restored to its `CpSolverStatus`
+  enum, objective value, best bound, conflicts, wall time, diagnostics) plus
+  the schedule. Diagnostics carry the root-cause entries when an infeasible
+  solve produced them. The raw CP-SAT `builder` is never serialized.
+  `save_result(output, path)` / `load_result(path)` are the file helpers
+  (dataset serialization logic from P1 is reused, not duplicated).
+
+## Service API facade (`aps_engine/api.py`)
+
+`plan(dataset_or_doc, objective="weighted_tardiness", params=None)` returns a
+`ResultDocument` (`{"result": SolveResult, "schedule": ...}`), the thin,
+stable programmatic boundary over the engine. It accepts a `Dataset` or a P1
+dataset JSON document (string or parsed dict), validates `objective` against
+the objective registry up-front (unknown names raise the same `KeyError` the
+CLI maps to exit 1), then runs the existing solve pipeline. The returned
+document is exactly the P2 persistence representation (diagnostics /
+root-cause included when present) and hides all solver internals —
+`ModelBuilder`, `CpModel`, `CpSolver`, `IntVar` — which never cross the
+facade. `plan` and `ResultDocument` are re-exported from `aps_engine`.
+
 ## Validator (`aps_engine/validation/validator.py`)
 
 Independent post-solve check that re-derives every rule from the
@@ -136,6 +171,10 @@ solver objective through the registry (default `weighted_tardiness`), validating
 the value against `registered_objectives()` and exiting 1 with a clear error on
 unknown or missing values. The `[3] SOLVING` section prints the selected
 objective (e.g. `OBJECTIVE (weighted tardiness):` or `OBJECTIVE (makespan):`).
+The entry point is `aps_engine.cli.main:main`, wired to `python -m aps_engine`
+(`aps_engine/__main__.py`) and to the installed `aps-engine` console script
+(`pyproject.toml [project.scripts]`); both preserve identical output and exit
+codes.
 
 ## Data flow
 
@@ -149,6 +188,13 @@ generator.generate_dataset()
   -> extract_schedule()            (operations/orders/objective)
   -> validator.validate()          (independent re-check)
   -> CLI report / exit code        (infeasible: Root cause via analyze_infeasibility)
+
+aps_engine.io.dataset_io.dataset_to_json(Dataset)
+  -> JSON document                 (dataset_from_json rebuilds the Dataset)
+plan(Dataset | dataset JSON doc, objective, params)   (facade, Phase 8)
+  -> ResultDocument                ({result: SolveResult, schedule} — no builder)
+  -> aps_engine.io.result_io.save_result(doc, path)   (result/schedule JSON)
+  -> aps-engine / python -m aps_engine                 (console entry point)
 
 greedy_solve(Dataset)              (deterministic reference; same validator)
   -> benchmark harness compares against solve() without mutating the Dataset

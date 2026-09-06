@@ -1,4 +1,4 @@
-# APS Engine — Phase 7 Objective Layer
+# APS Engine — Phase 8 Persistence & Service API
 
 A minimal but correct CP-SAT production scheduler for a wood-panel / furniture
 factory. Phase 5 adds machine setup (changeover) times on top of the Phase 4
@@ -22,6 +22,14 @@ Phase 7 makes the solver objective pluggable: the objective is extracted from
 with `weighted_tardiness` as the default and a deterministic `makespan`
 alternative, selectable through `SolverParams.objective` or the CLI
 `--objective` flag.
+
+Phase 8 productionizes the engine without changing its scheduling behaviour:
+datasets and solve results persist losslessly as versioned JSON documents
+(`aps_engine.io`), a thin programmatic facade
+(`aps_engine.api.plan`) exposes a stable service boundary over the solver
+without leaking CP-SAT internals, and a `aps-engine` console entry point is
+installed alongside `python -m aps_engine`. There is no HTTP/API server,
+database, frontend/Gantt or multi-tenancy layer.
 
 ## Scope
 
@@ -114,6 +122,53 @@ checked by the same validator. `aps_engine.benchmarks`
 Dataset and reports status, objective, wall time, operations scheduled and
 independent validity for each, asserting neither solver mutates the Dataset.
 
+## Persistence & service API
+
+Phase 8 exposes a versioned, machine-readable layer over the existing engine
+(`aps_engine/io/` and `aps_engine/api.py`). It adds no scheduling behaviour.
+
+**Dataset JSON persistence** — `aps_engine.io.dataset_io`:
+`dataset_to_json(dataset)` serializes a `Dataset` into a versioned JSON
+document (`aps-engine.dataset.v1`) and `dataset_from_json(data)` rebuilds it
+losslessly (accepting a JSON string or a parsed dict). The round trip
+preserves the whole domain graph — `meta`, products/orders/operations/
+routings, work centers/machines, skills/employees/shifts/calendar,
+maintenance/downtime, materials/BOMs/inventory — including the tuple-keyed
+`setup_matrix`, whose `(from_family, to_family)` keys are encoded as explicit
+`[from, to, minutes]` triples so
+`generate_dataset(sequence_dependent_setup=True)` round-trips exactly.
+Reconstructed datasets are deep-equal to the original and solve identically.
+
+**Result / schedule JSON persistence** — `aps_engine.io.result_io`:
+`result_to_json(output)` / `result_from_json(data)` round-trip a solve output
+(`SolveResult` status, status code, objective value, diagnostics, plus the
+schedule) as a versioned document (`aps-engine.result.v1`); diagnostics carry
+the root-cause information when an infeasible solve produced it. The raw
+CP-SAT `builder` is never serialized. `save_result(output, path)` and
+`load_result(path)` are the file helpers.
+
+**Service API facade** — `aps_engine.api`:
+`plan(dataset_or_doc, objective="weighted_tardiness", params=None)` returns a
+`ResultDocument` (`{"result": SolveResult, "schedule": ...}`) from either an
+existing `Dataset` or a P1 dataset JSON document (string or parsed dict). The
+objective is validated against the registry (unknown names raise the same
+`KeyError` as the CLI, before any model build) and the returned document is
+exactly the P2 persistence representation, so it can be stored verbatim with
+`save_result`. Raw `ModelBuilder` / `CpModel` / `CpSolver` / `IntVar` objects
+are never exposed. `plan` and `ResultDocument` are re-exported from
+`aps_engine`.
+
+```python
+from aps_engine import plan
+from aps_engine.generator import generate_dataset
+from aps_engine.io import dataset_to_json, save_result
+
+ds = generate_dataset(material_feasible=True, sequence_dependent_setup=True)
+doc = plan(ds, objective="makespan")          # dataset input
+doc2 = plan(dataset_to_json(ds))              # P1 JSON document input
+save_result(doc, "data/results/plan.json")    # P2 file persistence
+```
+
 ## Employees
 
 Skills: `CUTTING`, `EDGE_BANDING`, `CNC`, `ASSEMBLY`. The dataset has 9
@@ -169,10 +224,13 @@ aps_engine/
     solver/greedy.py      # deterministic greedy reference scheduler
     solver/diagnostics.py # infeasibility diagnostics (Phase 4) + root-cause analysis (Phase 6 P5)
     objectives/           # pluggable objective registry (weighted_tardiness, makespan)
+    io/dataset_io.py      # Dataset JSON persistence (dataset_to_json / dataset_from_json)
+    io/result_io.py       # result/schedule JSON persistence (result_to_json / result_from_json / save_result / load_result)
+    api.py                # programmatic service facade (plan() -> ResultDocument)
     validation/pre_solve.py  # pre-solve structural validation (Phase 4)
     validation/validator.py  # independent post-solve validator
     benchmarks/           # benchmark harness (solve vs greedy_solve)
-    cli/main.py           # CLI entry
+    cli/main.py           # CLI entry (aps-engine / python -m aps_engine)
     tests/
     test_generator.py
     test_validator.py
@@ -189,12 +247,17 @@ aps_engine/
 pip install -e .[dev]
 ```
 
+This registers the `aps-engine` console entry point (`pyproject.toml
+[project.scripts]` → `aps_engine.cli.main:main`), so the CLI runs both as a
+module and as an installed command.
+
 ## Run
 
 Generate, solve, extract, validate and print the report:
 
 ```bash
 python -m aps_engine
+aps-engine
 ```
 
 Exit codes: `0` for a feasible, validated schedule; `1` for an infeasible
@@ -220,6 +283,7 @@ OPTIMAL 39.0 under weighted tardiness and OPTIMAL 1350.0 under makespan:
 ```bash
 python -m aps_engine --material-feasible --objective weighted_tardiness
 python -m aps_engine --material-feasible --objective makespan
+aps-engine --material-feasible --objective makespan
 ```
 
 Compare the CP-SAT solver against the greedy reference scheduler:
@@ -314,6 +378,12 @@ before the existing layered diagnostics.
   deterministic in objective value across repeated runs
 - CLI `--objective` selects the objective and fails cleanly on invalid values
   (exit 1); default CLI output, exit codes and objective 39.0 are unchanged
-- Phase 1 through Phase 7 tests pass
+- Phase 1 through Phase 8 tests pass (369)
+- dataset and result/schedule JSON persistence round-trips losslessly
+  (including the sequence-dependent `setup_matrix`); loaded schedules pass the
+  validator
+- `plan()` facade returns a persistable result document from a Dataset or its
+  P1 JSON document without exposing CP-SAT internals, for both objectives
+- `aps-engine` console entry point preserves CLI output and exit codes
 - solver schedule passes validator
 - CLI runs successfully

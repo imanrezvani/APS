@@ -28,6 +28,11 @@
 | Phase 7 P2 — makespan objective | COMPLETE |
 | Phase 7 P3 — CLI objective selection (`--objective`) | COMPLETE |
 | Phase 7 P4 — documentation & housekeeping reconciliation | COMPLETE |
+| Phase 8 P1 — dataset JSON persistence (`aps_engine/io`) | COMPLETE |
+| Phase 8 P2 — result/schedule JSON persistence | COMPLETE |
+| Phase 8 P3 — service API facade (`aps_engine.api.plan`) | COMPLETE |
+| Phase 8 P4 — packaging & `aps-engine` console entry point | COMPLETE |
+| Phase 8 P5 — documentation & reconciliation | COMPLETE |
 
 ## Current state
 
@@ -59,10 +64,21 @@
   (`min sum(order.priority * tardiness(order))`, the original single
   objective) and `makespan` (`min max(end_time over all operations)`). The
   CLI selects the objective with `--objective <name>`.
+- The engine is service-ready (Phase 8): a Dataset or a P1 dataset JSON
+  document solves through the programmatic facade
+  `aps_engine.api.plan(dataset_or_doc, objective=..., params=None)` which
+  returns a machine-consumable result document (result + schedule; never the
+  raw CP-SAT builder). Datasets round-trip losslessly through
+  `aps_engine.io.dataset_io` (including the tuple-keyed `setup_matrix`), and
+  solve results/schedules round-trip through `aps_engine.io.result_io` with
+  explicit file helpers. The `aps-engine` console entry point
+  (`pyproject.toml [project.scripts]`) is the installed equivalent of
+  `python -m aps_engine`. There is no HTTP/API server, frontend/Gantt,
+  database, multi-tenancy, scenario/what-if or AI/Copilot layer.
 
 ## Tests / status
 
-- Full suite: **315 passed, 0 failed, 0 skipped** (`python -m pytest`).
+- Full suite: **369 passed, 0 failed, 0 skipped** (`python -m pytest`).
 - Coverage: generator 9, validator 24, solver 20, setup 9, diagnostics 10,
   pre-solve 17, CLI E2E 2, sequence-dependent setup 24, material + BOM 13,
   inventory 11, BOM integration 17, material requirements 20,
@@ -71,7 +87,7 @@
   material-feasible scenario 8, CLI material report 5, generator setup
   families 5, greedy 15, benchmark 7, CLI setup summary 2, feasibility
   diagnostics 16, validator material 6, objectives 7, makespan 5, CLI
-  objective 5.
+  objective 5, dataset IO 20, result IO 15, API facade 16, packaging 3.
 - Regression: `test_operation_assigned_elsewhere_not_constrained_by_candidate_pair`
   proves an op assigned to another machine is not constrained by an unselected
   machine's changeover (PANEL->FLAT = 100000, both ops still start at 480).
@@ -90,6 +106,16 @@
   `valid: True violations: 0`; makespan is deterministic across repeated runs.
 - CLI invalid objective (`--objective bogus`): exit 1, stderr
   `ERROR: unknown objective 'bogus' (valid: makespan, weighted_tardiness)`.
+- CLI console entry point (`aps-engine`, installed via `pip install -e .`):
+  byte-identical output and identical exit codes to
+  `python -m aps_engine` for the feasible (exit 0), infeasible (exit 1),
+  makespan (exit 0, `OBJECTIVE (makespan): 1350.0`) and invalid-objective
+  (exit 1) paths.
+- Persistence/API smoke: `plan()` on the Dataset and on its P1 JSON document
+  returns OPTIMAL 39.0 (weighted_tardiness) / 1350.0 (makespan) documents
+  that persist/load through `aps_engine.io.result_io` and whose loaded
+  schedules validate with zero violations; the persisted result document
+  contains no raw builder / CP-SAT object.
 - Family-enabled consistency
   (`generate_dataset(sequence_dependent_setup=True, material_feasible=True)`):
   cp-sat OPTIMAL 39.0 / valid; greedy FEASIBLE 11550.0 / valid; feasibility
@@ -193,7 +219,62 @@ model, implemented through the standard staged workflow.
   objective layer; test count and CLI verification recorded; all Phase 7 work
   committed. No solver, model, validator, generator or CLI behaviour changed.
 
+**Phase 8 — productionization: persistence, service API, packaging**
+(COMPLETE). Phase 8 converts the completed engine into a persistent,
+service-ready core. It adds no scheduling intelligence: no new objectives,
+constraints, algorithms or CLI output were introduced, and every Phase 1-7
+behaviour (solver, model, validator, generator, CLI reports, exit codes,
+banners) is unchanged. It explicitly does NOT add an HTTP/API server,
+frontend/Gantt, database (persistence is JSON files only), multi-tenancy,
+scenario/what-if, job queues or AI/Copilot.
+
+- **P1 (complete)** — dataset JSON persistence: `aps_engine/io/dataset_io.py`
+  serializes a `Dataset` to a versioned JSON document
+  (`aps-engine.dataset.v1`) and rebuilds it losslessly
+  (`dataset_to_json` / `dataset_from_json`). The round trip preserves the
+  complete domain object graph including `meta`, materials/BOMs/inventory,
+  calendars, employees/skills and the tuple-keyed `setup_matrix` (encoded as
+  explicit `[from, to, minutes]` triples), so
+  `generate_dataset(sequence_dependent_setup=True)` round-trips exactly.
+  Reconstructed datasets are deep-equal to the original and solve to the
+  same OPTIMAL values (39.0 weighted_tardiness, 1350.0 makespan). Tests in
+  `tests/test_dataset_io.py`.
+- **P2 (complete)** — result/schedule JSON persistence:
+  `aps_engine/io/result_io.py` serializes a solve output document
+  (`aps-engine.result.v1`) containing `SolveResult` (status, status code,
+  objective value, best bound, conflicts, wall time) plus the schedule and
+  diagnostics (which carry root-cause information when present). Status codes
+  are stored as integers and restored to their `CpSolverStatus` enum so
+  `SolveResult.optimal` keeps working. The raw CP-SAT `builder` is never
+  serialized. API: `result_to_json` / `result_from_json` (string or parsed
+  dict) plus `save_result` / `load_result` file helpers. Loaded schedules
+  pass the independent validator. Tests in `tests/test_result_io.py`.
+- **P3 (complete)** — service API facade: `aps_engine/api.py` exposes
+  `plan(dataset_or_doc, objective="weighted_tardiness", params=None)` ->
+  `ResultDocument`, a thin programmatic boundary that accepts a `Dataset` or
+  the P1 dataset JSON document (string or parsed dict), validates the
+  objective through the registry (unknown names raise the same `KeyError` as
+  the CLI), runs the existing solve pipeline and returns a
+  machine-consumable document in the exact P2 representation (`result` +
+  `schedule`, including diagnostics/root-cause when present) — never the raw
+  `ModelBuilder` / `CpModel` / `CpSolver` / `IntVar`. `plan` and
+  `ResultDocument` are re-exported from `aps_engine/__init__.py`. Tests in
+  `tests/test_api.py`.
+- **P4 (complete)** — packaging & console entry point: `pyproject.toml`
+  gained `[project.scripts]` with `aps-engine = "aps_engine.cli.main:main"`
+  and a phase-neutral project description (runtime dependencies unchanged);
+  `aps_engine/__init__.py` keeps `__version__`, `plan` and `ResultDocument`
+  and gained a package docstring. Both `python -m aps_engine` and the
+  installed `aps-engine` command were verified to preserve the existing CLI
+  behaviour, output and exit codes. Tests in `tests/test_packaging.py`.
+- **P5 (complete)** — documentation & reconciliation: this file, `README.md`
+  and `docs/ARCHITECTURE.md` updated to cover the Phase 8 surface (IO layer,
+  `plan` facade, `aps-engine` entry point); test count (369) and CLI /
+  persistence / API verification recorded. No solver, model, validator,
+  generator or CLI behaviour changed.
+
 ## Next planned phase
 
-None — the documented roadmap is fully implemented. Any future phase is
-not planned in this repository yet.
+None — Phases 1 through 8 (the documented roadmap, including the Phase 8
+productionization: persistence, service API facade and packaging) are fully
+implemented. Any future phase is not planned in this repository yet.

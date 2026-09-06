@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "aps-engine"
 version = "0.1.0"
-description = "Phase 1 core production scheduler for a wood/furniture factory, built on OR-Tools CP-SAT."
+description = "Deterministic production scheduler for a wood/furniture factory (orders, operations, machines, shifts, employees, skills, materials) built on OR-Tools CP-SAT, with JSON dataset/result persistence and a service API facade."
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
@@ -14,6 +14,9 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=7"]
+
+[project.scripts]
+aps-engine = "aps_engine.cli.main:main"
 
 [tool.setuptools.packages.find]
 include = ["aps_engine*"]
