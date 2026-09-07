@@ -65,3 +65,65 @@ def test_version_endpoint(client):
 def test_unknown_route_404(client):
     response = client.get("/does-not-exist")
     assert response.status_code == 404
+
+
+# --------------------------------------------------------------------------- P2
+
+def test_plan_default_objective(client, material_dataset_document):
+    response = client.post("/plans", json={"dataset": material_dataset_document})
+    assert response.status_code == 200
+    body = response.json()
+    assert set(body) == {"result", "schedule"}
+    assert body["result"]["status"] == "OPTIMAL"
+    assert body["result"]["feasible"] is True
+    assert body["result"]["objective_value"] == 39.0
+    assert body["schedule"] is not None
+    assert "operations" in body["schedule"] and "orders" in body["schedule"]
+
+
+def test_plan_weighted_tardiness_explicit(client, material_dataset_document):
+    response = client.post(
+        "/plans",
+        json={"dataset": material_dataset_document, "objective": "weighted_tardiness"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["result"]["objective_value"] == 39.0
+    assert body["result"]["status"] == "OPTIMAL"
+
+
+def test_plan_makespan(client, material_dataset_document):
+    response = client.post(
+        "/plans",
+        json={"dataset": material_dataset_document, "objective": "makespan"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["result"]["status"] == "OPTIMAL"
+    assert body["result"]["objective_value"] == 1350.0
+    assert body["schedule"] is not None
+
+
+def test_plan_with_params(client, material_dataset_document):
+    response = client.post(
+        "/plans",
+        json={
+            "dataset": material_dataset_document,
+            "objective": "makespan",
+            "params": {"time_limit_seconds": 30, "num_search_workers": 2, "random_seed": 42},
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["result"]["objective_value"] == 1350.0
+
+
+def test_plan_infeasible_dataset_is_not_server_error(client, infeasible_dataset_document):
+    response = client.post("/plans", json={"dataset": infeasible_dataset_document})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["result"]["status"] == "INFEASIBLE"
+    assert body["result"]["feasible"] is False
+    assert body["schedule"] is None
+    assert len(body["result"]["diagnostics"]) > 0
+    codes = {d["code"] for d in body["result"]["diagnostics"]}
+    assert "MATERIAL_SHORTAGE" in codes

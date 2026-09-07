@@ -1,20 +1,25 @@
-"""FastAPI application factory (Phase 9 P1).
+"""FastAPI application factory (Phase 9 P1/P2).
 
 The application is importable without starting a server: importing this
 module builds the ``app`` object, and ``create_app()`` returns a fresh
-instance for tests or embedding. No solver logic lives in route handlers -
-the routes only read engine/package metadata.
+instance for tests or embedding. The application boundary
+(``aps_api.service.PlanningService``) is attached to ``app.state`` so route
+handlers delegate planning to it without ever touching the engine directly.
 
-S9-P1 provides the two system endpoints:
+Endpoints:
 
-* ``GET /health``   - liveness probe (always 200 when the app is up).
-* ``GET /version``  - the package version, read from the single package
+* ``GET /health``  - liveness probe (always 200 when the app is up).
+* ``GET /version`` - the package version, read from the single package
   version source (``pyproject.toml`` distribution metadata) rather than
   being duplicated here.
+* ``POST /plans``  - submit a Phase 8 dataset JSON document and receive the
+  planning result through the existing ``aps_engine.api.plan`` facade.
 """
 
 from fastapi import FastAPI
 
+from aps_api.routes.plans import router as plans_router
+from aps_api.service import PlanningService
 from aps_api.version import get_package_version, get_service_name
 
 
@@ -28,6 +33,7 @@ def create_app() -> FastAPI:
         ),
         version=get_package_version(),
     )
+    application.state.service = PlanningService()
 
     @application.get("/health", tags=["system"])
     def health() -> dict:
@@ -39,6 +45,7 @@ def create_app() -> FastAPI:
         """The package version from the single package version source."""
         return {"name": get_service_name(), "version": get_package_version()}
 
+    application.include_router(plans_router)
     return application
 
 
