@@ -5,21 +5,26 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "aps-engine"
 version = "0.1.0"
-description = "Deterministic production scheduler for a wood/furniture factory (orders, operations, machines, shifts, employees, skills, materials) built on OR-Tools CP-SAT, with JSON dataset/result persistence and a service API facade."
+description = "Deterministic production scheduler for a wood/furniture factory (orders, operations, machines, shifts, employees, skills, materials) built on OR-Tools CP-SAT, with JSON dataset/result persistence, a service API facade and a thin FastAPI application layer (aps_api)."
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
     "ortools>=9.8",
+    "fastapi>=0.110",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7"]
+dev = [
+    "pytest>=7",
+    "httpx>=0.27",
+    "uvicorn>=0.29",
+]
 
 [project.scripts]
 aps-engine = "aps_engine.cli.main:main"
 
 [tool.setuptools.packages.find]
-include = ["aps_engine*"]
+include = ["aps_engine*", "aps_api*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
