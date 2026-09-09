@@ -54,7 +54,17 @@ class PlanningRequest(BaseModel):
 # ------------------------------------------------------------------ response
 
 class Diagnostic(BaseModel):
-    """One layered feasibility diagnostic entry."""
+    """One layered feasibility diagnostic entry.
+
+    The ``code`` is the engine's own layered root-cause code preserved
+    verbatim from ``aps_engine.solver.diagnostics`` (e.g. STRUCTURAL_
+    INVALIDITY, MATERIAL_SHORTAGE, EMPLOYEE_SHORTAGE, CAPACITY_SHORTAGE,
+    MAINTENANCE_DOWNTIME, CALENDAR_LIMITATION, SETUP_CHANGEOVER_BURDEN,
+    UNKNOWN_INFEASIBILITY). The HTTP layer never redesigns or remaps the
+    diagnostic taxonomy; it only translates engine output to JSON-safe rows.
+    ``code`` is a free-form string so new engine codes keep flowing through
+    unchanged.
+    """
 
     model_config = {"extra": "forbid"}
 

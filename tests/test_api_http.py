@@ -235,3 +235,61 @@ def test_success_payload_is_json_serializable(client, material_dataset_document)
     response = client.post("/plans", json={"dataset": material_dataset_document})
     assert response.status_code == 200
     _json.dumps(response.json())
+
+
+# --------------------------------------------------------------------------- P4
+# Diagnostics/root-cause preservation through the HTTP boundary.
+
+def test_infeasible_employee_shortage_diagnostics(client):
+    from aps_engine.generator import generate_infeasible_dataset
+    from aps_engine.io import dataset_to_json
+
+    document = json.loads(dataset_to_json(generate_infeasible_dataset()))
+    response = client.post("/plans", json={"dataset": document})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["result"]["feasible"] is False
+    assert body["schedule"] is None
+    assert len(body["result"]["diagnostics"]) > 0
+    codes = {d["code"] for d in body["result"]["diagnostics"]}
+    assert "EMPLOYEE_SHORTAGE" in codes
+
+
+def test_infeasible_diagnostic_rows_have_expected_keys(client, infeasible_dataset_document):
+    response = client.post("/plans", json={"dataset": infeasible_dataset_document})
+    body = response.json()
+    for diagnostic in body["result"]["diagnostics"]:
+        assert set(diagnostic) == {
+            "code", "order_id", "operation_id", "resource_type", "resource_id", "reason"
+        }
+        assert isinstance(diagnostic["code"], str)
+        assert isinstance(diagnostic["reason"], str)
+
+
+def test_infeasible_diagnostics_are_json_safe(client, infeasible_dataset_document):
+    import json as _json
+
+    response = client.post("/plans", json={"dataset": infeasible_dataset_document})
+    assert response.status_code == 200
+    text = response.text
+    assert "CpSolverStatus" not in text
+    assert "Model " not in text
+    _json.dumps(response.json())
+
+
+def test_infeasible_material_and_employee_never_500(client):
+    from aps_engine.generator import generate_infeasible_dataset
+    from aps_engine.io import dataset_to_json
+
+    cases = [
+        _load_dataset_document(material_feasible=False),
+        json.loads(dataset_to_json(generate_infeasible_dataset())),
+    ]
+    for document in cases:
+        response = client.post("/plans", json={"dataset": document})
+        assert response.status_code == 200
+        body = response.json()
+        assert body["result"]["status"] == "INFEASIBLE"
+        assert body["result"]["feasible"] is False
+        assert body["schedule"] is None
+        assert body["result"]["diagnostics"]
