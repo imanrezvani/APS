@@ -1,4 +1,4 @@
-"""Phase 8 P4 packaging / entry-point tests.
+"""Phase 8 P4 packaging / entry-point tests (extended by Phase 9 P6).
 
 The heavy CLI end-to-end behaviour (``python -m aps_engine`` subprocess,
 schedule/validation output, exit codes) is covered by the existing
@@ -8,6 +8,10 @@ verify the packaging wiring only: that ``pyproject.toml`` declares the
 that dotted target resolves to the real ``main`` callable, and that
 ``main`` returns the int exit status the generated console wrapper feeds to
 ``sys.exit``.
+
+The Phase 9 P6 regression block additionally exercises the real entry
+points in subprocesses (``python -m aps_engine`` and the installed
+``aps-engine`` console script) to prove the API layer did not break them.
 """
 
 from importlib import import_module
@@ -37,3 +41,53 @@ def test_main_returns_exit_status_integer():
     assert main(["--objective"]) == 1
     # A successful run maps to exit code 0.
     assert main(["--material-feasible"]) == 0
+
+
+# --------------------------------------------------------------------------- P6
+# Phase 9 regression: the CLI and the installed ``aps-engine`` console script
+# must remain functional after the API layer was added on top of the engine.
+
+def test_module_cli_entry_unknown_objective_returns_1():
+    import subprocess
+    import sys
+
+    result = subprocess.run(
+        [sys.executable, "-m", "aps_engine", "--objective", "bogus"],
+        cwd=ROOT, capture_output=True, text=True, timeout=120,
+    )
+    assert result.returncode == 1
+    assert "unknown objective" in result.stderr
+
+
+def test_console_script_entry_successful_run():
+    import shutil
+    import subprocess
+
+    executable = shutil.which("aps-engine")
+    if executable is None:
+        import pytest
+
+        pytest.skip("aps-engine console script not on PATH")
+    result = subprocess.run(
+        [executable, "--material-feasible"], cwd=ROOT,
+        capture_output=True, text=True, timeout=300,
+    )
+    assert result.returncode == 0
+    assert "VALIDATION" in result.stdout
+
+
+def test_console_script_entry_unknown_objective_exit_code():
+    import shutil
+    import subprocess
+
+    executable = shutil.which("aps-engine")
+    if executable is None:
+        import pytest
+
+        pytest.skip("aps-engine console script not on PATH")
+    result = subprocess.run(
+        [executable, "--objective", "bogus"], cwd=ROOT,
+        capture_output=True, text=True, timeout=120,
+    )
+    assert result.returncode == 1
+    assert "unknown objective" in result.stderr
