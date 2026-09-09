@@ -1,4 +1,4 @@
-# APS Engine — Phase 8 Persistence & Service API
+# APS Engine — Phase 8 Persistence & Service API, Phase 9 HTTP/Application API
 
 A minimal but correct CP-SAT production scheduler for a wood-panel / furniture
 factory. Phase 5 adds machine setup (changeover) times on top of the Phase 4
@@ -28,8 +28,15 @@ datasets and solve results persist losslessly as versioned JSON documents
 (`aps_engine.io`), a thin programmatic facade
 (`aps_engine.api.plan`) exposes a stable service boundary over the solver
 without leaking CP-SAT internals, and a `aps-engine` console entry point is
-installed alongside `python -m aps_engine`. There is no HTTP/API server,
-database, frontend/Gantt or multi-tenancy layer.
+installed alongside `python -m aps_engine`.
+
+Phase 9 adds a thin HTTP/Application API boundary around that service-ready
+core: a dedicated `aps_api` FastAPI package exposes `GET /health`,
+`GET /version` and `POST /plans` (submit a Phase 8 dataset JSON document and
+receive a JSON-safe ResultDocument-compatible response). The HTTP layer never
+contains solver logic — routes delegate to `aps_engine.api.plan()` through an
+application/service boundary. There is no database, frontend/Gantt,
+multi-tenancy, authentication, async worker queue or deployment layer yet.
 
 ## Scope
 
@@ -169,6 +176,160 @@ doc2 = plan(dataset_to_json(ds))              # P1 JSON document input
 save_result(doc, "data/results/plan.json")    # P2 file persistence
 ```
 
+## HTTP API (Phase 9)
+
+A dedicated FastAPI application package (`aps_api`) wraps the Phase 8 service
+facade. It is importable without starting a server
+(`from aps_api import app`, or build a fresh instance with `create_app()`)
+and is suitable for future deployment, but Phase 9 ships no deployment
+configuration.
+
+### Start the API locally
+
+```bash
+# FastAPI / uvicorn are installed as part of `pip install -e .[dev]`.
+python -m uvicorn aps_api.app:app --host 127.0.0.1 --port 8000
+```
+
+Interactive OpenAPI docs: http://127.0.0.1:8000/docs
+
+### Endpoints
+
+| Method | Path      | Purpose |
+|--------|-----------|---------|
+| GET    | `/health` | Liveness probe: `{"status": "ok", "service": "aps-engine"}` |
+| GET    | `/version`| `{"name": "aps-engine", "version": "<pyproject version>"}` — read from the single package version source (`importlib.metadata`), never duplicated |
+| POST   | `/plans`  | Submit a Phase 8 dataset JSON document and receive the planning result |
+
+### Health and version
+
+```bash
+curl http://127.0.0.1:8000/health
+curl http://127.0.0.1:8000/version
+```
+
+### Create a plan
+
+`POST /plans` accepts a JSON body whose `dataset` field is a dataset document
+in the exact Phase 8 persistence format (the object produced by
+`dataset_to_json(dataset)`). The `objective` is optional (default
+`weighted_tardiness`; `makespan` is the other registered objective) and an
+optional `params` object may override the deterministic solver settings
+(`time_limit_seconds` 1-3600 default 30, `num_search_workers` 1-32 default 2,
+`random_seed` default 42).
+
+```bash
+# Generate a dataset document once and post it
+python - <<'PY'
+import json
+from aps_engine.generator import generate_dataset
+from aps_engine.io import dataset_to_json
+json.dump(json.loads(dataset_to_json(
+    generate_dataset(material_feasible=True, sequence_dependent_setup=True))),
+    open("/tmp/dataset.json", "w"))
+PY
+
+curl -s -X POST http://127.0.0.1:8000/plans \
+  -H "Content-Type: application/json" \
+  -d @/tmp/dataset.json
+```
+
+Equivalent with an explicit objective and solver params:
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/plans \
+  -H "Content-Type: application/json" \
+  -d '{
+    "dataset": <dataset document>,
+    "objective": "makespan",
+    "params": {"time_limit_seconds": 30, "num_search_workers": 2, "random_seed": 42}
+  }'
+```
+
+### Request / response behaviour
+
+The response is JSON-serializable and compatible with the Phase 8
+ResultDocument semantics:
+
+```json
+{
+  "result": {
+    "status": "OPTIMAL",
+    "status_code": 0,
+    "feasible": true,
+    "objective_value": 1350.0,
+    "best_bound": 1350.0,
+    "num_conflicts": 0,
+    "num_branches": 0,
+    "wall_time": 1.23,
+    "diagnostics": []
+  },
+  "schedule": {
+    "operations": [{"operation_id": "OP000", "order_id": "ORD000",
+                    "machine_id": "...", "employee_id": "...",
+                    "start": 480, "end": 540}],
+    "orders": [{"order_id": "ORD000", "completion_time": 900,
+                "due_time": 960, "tardiness": 0}],
+    "objective_value": 1350.0
+  }
+}
+```
+
+No CP-SAT model objects, solver internals or non-serializable enums are ever
+exposed. Validation happens before planner execution: an invalid objective or
+dataset document never reaches the solver.
+
+### Infeasibility semantics
+
+An infeasible production plan is a **valid planning result**, not an API or
+server failure. A valid request whose dataset cannot be scheduled returns
+**HTTP 200** with `schedule: null`, `result.status: "INFEASIBLE"`,
+`result.feasible: false` and the engine's layered diagnostics preserved in
+`result.diagnostics` (rows with `code`, `order_id`, `operation_id`,
+`resource_type`, `resource_id`, `reason`). Root-cause codes such as
+`MATERIAL_SHORTAGE`, `EMPLOYEE_SHORTAGE`, `CAPACITY_SHORTAGE`,
+`CALENDAR_LIMITATION`, `MAINTENANCE_DOWNTIME`, `SETUP_CHANGEOVER_BURDEN`,
+`STRUCTURAL_INVALIDITY` and `UNKNOWN_INFEASIBILITY` are carried through
+unchanged; the API never turns solver infeasibility into an HTTP 500.
+
+### Invalid requests
+
+Every non-2xx response uses the same structured envelope
+`{"error": {"code", "message", "details"?}}` and never leaks a stack trace:
+
+| Status | Error code                 | Meaning |
+|--------|----------------------------|---------|
+| 400    | `INVALID_DATASET_DOCUMENT` | `dataset` is not a valid Phase 8 dataset document |
+| 400    | `UNKNOWN_OBJECTIVE`        | objective not in the registry (lists valid names) |
+| 422    | `VALIDATION_ERROR`         | malformed JSON / schema violation (`details` lists the fields) |
+| 404    | `HTTP_404`                 | unknown route |
+| 500    | `INTERNAL_ERROR`           | unexpected internal failure (no internal detail exposed) |
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/plans \
+  -H "Content-Type: application/json" \
+  -d '{"dataset": {"orders": []}, "objective": "does_not_exist"}'
+# -> 400 {"error":{"code":"UNKNOWN_OBJECTIVE","message":"unknown objective
+#     'does_not_exist' (valid: makespan, weighted_tardiness)"}}
+```
+
+### Application boundary & async readiness
+
+`aps_api/executor.py` introduces a minimal `PlanExecutor` abstraction
+(`SyncPlanExecutor` today). The routes call
+`aps_api.service.PlanningService.create_plan`, which delegates to the
+executor, which calls `aps_engine.api.plan()`. Because the executor is
+injectable (also via `create_app(service=...)`), a future phase can evolve
+synchronous `POST /plans` execution into job creation -> worker -> result
+retrieval without rewriting the routes or the APS Engine. Phase 9 implements
+**no** async worker, job queue, Celery/Redis or message broker.
+
+### Phase 9 does NOT yet provide
+
+Authentication, a database, multi-tenancy, a frontend/Gantt UI, async
+workers/job queues, or a production deployment. Only the thin synchronous
+HTTP boundary described above is implemented.
+
 ## Employees
 
 Skills: `CUTTING`, `EDGE_BANDING`, `CNC`, `ASSEMBLY`. The dataset has 9
@@ -231,6 +392,14 @@ aps_engine/
     validation/validator.py  # independent post-solve validator
     benchmarks/           # benchmark harness (solve vs greedy_solve)
     cli/main.py           # CLI entry (aps-engine / python -m aps_engine)
+aps_api/                 # Phase 9 FastAPI HTTP/Application boundary
+    app.py                # create_app() -> FastAPI (/health, /version, /plans)
+    version.py            # package version from importlib.metadata (single source)
+    schemas.py            # Pydantic request/response/error contracts
+    errors.py             # PlanningError + deterministic error envelope handlers
+    executor.py           # PlanExecutor abstraction (SyncPlanExecutor)
+    service.py            # PlanningService (thin service boundary)
+    routes/plans.py       # POST /plans handler (delegates to the service)
     tests/
     test_generator.py
     test_validator.py
@@ -239,6 +408,8 @@ aps_engine/
     test_diagnostics.py
     test_pre_solve.py
     test_cli_e2e.py
+    test_api_http.py      # Phase 9 HTTP integration tests
+    test_api_service.py   # Phase 9 service/executor/schema unit tests
 ```
 
 ## Install
@@ -296,6 +467,12 @@ Run the tests:
 
 ```bash
 python -m pytest
+```
+
+Run only the Phase 9 API tests:
+
+```bash
+python -m pytest tests/test_api_http.py tests/test_api_service.py
 ```
 
 ## Dataset
@@ -378,12 +555,22 @@ before the existing layered diagnostics.
   deterministic in objective value across repeated runs
 - CLI `--objective` selects the objective and fails cleanly on invalid values
   (exit 1); default CLI output, exit codes and objective 39.0 are unchanged
-- Phase 1 through Phase 8 tests pass (369)
+- Phase 1 through Phase 9 tests pass (410)
 - dataset and result/schedule JSON persistence round-trips losslessly
   (including the sequence-dependent `setup_matrix`); loaded schedules pass the
   validator
 - `plan()` facade returns a persistable result document from a Dataset or its
   P1 JSON document without exposing CP-SAT internals, for both objectives
 - `aps-engine` console entry point preserves CLI output and exit codes
+- FastAPI application imports without starting a server; `/health` and
+  `/version` work; `/version` reads the single package version source
+- `POST /plans` accepts a Phase 8 dataset JSON document and returns a JSON-safe
+  ResultDocument-compatible response for the default, `weighted_tardiness` and
+  `makespan` objectives, without exposing CP-SAT/solver internals
+- infeasible datasets return HTTP 200 with `schedule: null` and the engine's
+  layered diagnostics preserved (never an HTTP 500); invalid requests return
+  deterministic structured 4xx errors with no stack-trace leakage
+- async-ready `PlanExecutor` boundary exists with no external queue
+  infrastructure
 - solver schedule passes validator
 - CLI runs successfully

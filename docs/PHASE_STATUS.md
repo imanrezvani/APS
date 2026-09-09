@@ -33,6 +33,13 @@
 | Phase 8 P3 — service API facade (`aps_engine.api.plan`) | COMPLETE |
 | Phase 8 P4 — packaging & `aps-engine` console entry point | COMPLETE |
 | Phase 8 P5 — documentation & reconciliation | COMPLETE |
+| Phase 9 P1 — HTTP API foundation (FastAPI app, `/health`, `/version`) | COMPLETE |
+| Phase 9 P2 — planning endpoint (`POST /plans`) | COMPLETE |
+| Phase 9 P3 — API contracts (request/response schemas, deterministic 4xx) | COMPLETE |
+| Phase 9 P4 — error & diagnostics contract (root-cause preservation) | COMPLETE |
+| Phase 9 P5 — async-ready application boundary (executor abstraction) | COMPLETE |
+| Phase 9 P6 — API integration tests | COMPLETE |
+| Phase 9 P7 — documentation & reconciliation | COMPLETE |
 
 ## Current state
 
@@ -73,12 +80,26 @@
   solve results/schedules round-trip through `aps_engine.io.result_io` with
   explicit file helpers. The `aps-engine` console entry point
   (`pyproject.toml [project.scripts]`) is the installed equivalent of
-  `python -m aps_engine`. There is no HTTP/API server, frontend/Gantt,
-  database, multi-tenancy, scenario/what-if or AI/Copilot layer.
+  `python -m aps_engine`.
+- The engine is now exposed through a thin HTTP/Application API boundary
+  (Phase 9): a dedicated `aps_api` FastAPI package whose routes only delegate
+  to the Phase 8 service facade through `aps_engine.api.plan()`. Endpoints:
+  `GET /health` (liveness), `GET /version` (single source of truth from the
+  package version / distribution metadata, never duplicated) and
+  `POST /plans` (submit a Phase 8 dataset JSON document; default,
+  `weighted_tardiness` and `makespan` objectives; returns a JSON-safe
+  ResultDocument-compatible payload). An infeasible plan is a valid 200
+  response (schedule `null` plus preserved layered diagnostics), invalid
+  requests get a deterministic structured 4xx envelope, and solver/CP-SAT
+  internals never leak into responses. A minimal `PlanExecutor` abstraction
+  (`aps_api/executor.py`) prepares the boundary for a future async
+  job/worker phase without adding queue infrastructure. There is still no
+  frontend/Gantt, database, multi-tenancy, scenario/what-if, async workers,
+  authentication, AI/Copilot or deployment layer.
 
 ## Tests / status
 
-- Full suite: **369 passed, 0 failed, 0 skipped** (`python -m pytest`).
+- Full suite: **410 passed, 0 failed, 0 skipped** (`python -m pytest`).
 - Coverage: generator 9, validator 24, solver 20, setup 9, diagnostics 10,
   pre-solve 17, CLI E2E 2, sequence-dependent setup 24, material + BOM 13,
   inventory 11, BOM integration 17, material requirements 20,
@@ -87,7 +108,8 @@
   material-feasible scenario 8, CLI material report 5, generator setup
   families 5, greedy 15, benchmark 7, CLI setup summary 2, feasibility
   diagnostics 16, validator material 6, objectives 7, makespan 5, CLI
-  objective 5, dataset IO 20, result IO 15, API facade 16, packaging 3.
+  objective 5, dataset IO 20, result IO 15, API facade 16, packaging 6,
+  API service/executor/schema 16, API HTTP 22.
 - Regression: `test_operation_assigned_elsewhere_not_constrained_by_candidate_pair`
   proves an op assigned to another machine is not constrained by an unselected
   machine's changeover (PANEL->FLAT = 100000, both ops still start at 480).
@@ -273,8 +295,90 @@ scenario/what-if, job queues or AI/Copilot.
   persistence / API verification recorded. No solver, model, validator,
   generator or CLI behaviour changed.
 
+**Phase 9 — HTTP/Application API foundation** (COMPLETE). Phase 9 establishes
+a thin, production-oriented FastAPI boundary around the completed engine. It
+adds no scheduling intelligence and does NOT rewrite the APS Engine: routes
+never contain solver/domain logic and never duplicate `plan()`. Architecture:
+`Client -> FastAPI HTTP API -> application/service boundary ->
+aps_engine.api.plan() -> APS Engine -> CP-SAT / Greedy / Validation /
+Diagnostics`. The API application lives in its own `aps_api` package
+(`pyproject.toml` now packages `aps_engine*` and `aps_api*`) and imports
+cleanly without starting a server. Phase 9 explicitly does NOT provide
+authentication, a database, multi-tenancy, a frontend/Gantt, async workers /
+job queues, or a production deployment; those belong to future phases.
+
+- **P1 (complete)** — HTTP API foundation: `aps_api/app.py` `create_app()`
+  builds the FastAPI application (importable object `aps_api.app.app`).
+  `GET /health` returns `{status, service}` liveness, and `GET /version`
+  returns `{name, version}` where version comes from the single package
+  version source via `importlib.metadata` (`aps_api/version.py`,
+  `get_package_version`) — never manually duplicated. Runtime dependency
+  `fastapi>=0.110` plus dev extras `httpx`, `uvicorn` added to
+  `pyproject.toml`. Tests in `tests/test_api_http.py`.
+- **P2 (complete)** — planning endpoint: `POST /plans` accepts a JSON dataset
+  document in the Phase 8 persistence format and delegates to the Phase 8
+  facade `aps_engine.api.plan()` through the application boundary
+  (`aps_api/service.py` + `aps_api/routes/plans.py`). Default objective
+  behaviour is unchanged; `weighted_tardiness` and `makespan` both work.
+  Responses are JSON-serializable and ResultDocument-compatible
+  (`{result, schedule}`); CP-SAT model objects, solver internals and
+  non-serializable enums are never exposed.
+- **P3 (complete)** — API contracts: explicit Pydantic schemas in
+  `aps_api/schemas.py` for the planning request (`PlanningRequest` /
+  `PlanningParams`), the planning response (`PlanningResponse`), the
+  solve/result information (`ResultInfo`), the schedule (`Schedule`,
+  `ScheduleOperation`, `ScheduleOrder`) and diagnostics (`Diagnostic`).
+  Request validation happens *before* planner execution in the executor
+  (`aps_api/executor.py`): invalid dataset documents and unknown objectives
+  raise the domain `PlanningError` and never reach the solver. Invalid
+  JSON / schema violations produce a deterministic 422 `VALIDATION_ERROR`;
+  invalid domain payloads produce 400 (`INVALID_DATASET_DOCUMENT`,
+  `UNKNOWN_OBJECTIVE`); unexpected internal failures produce a generic 500
+  `INTERNAL_ERROR`. Every non-2xx response uses the single structured
+  envelope `{"error": {"code", "message", "details"?}}`
+  (`aps_api/errors.py`); no stack traces or internal implementation details
+  leak.
+- **P4 (complete)** — error & diagnostics contract: infeasible plans remain
+  valid 200 responses with `schedule: null`, `result.status: INFEASIBLE` and
+  the engine's layered diagnostics preserved verbatim (schedule `null` is
+  never an HTTP 500). The HTTP layer only translates existing engine results
+  into API-safe JSON rows (`code`, `order_id`, `operation_id`,
+  `resource_type`, `resource_id`, `reason`) and does not redesign the
+  diagnostic taxonomy (MATERIAL_SHORTAGE, EMPLOYEE_SHORTAGE,
+  CAPACITY_SHORTAGE, CALENDAR_LIMITATION, MAINTENANCE_DOWNTIME,
+  SETUP_CHANGEOVER_BURDEN, STRUCTURAL_INVALIDITY, UNKNOWN_INFEASIBILITY);
+  `code` is a free-form string so new engine codes flow through unchanged.
+- **P5 (complete)** — async-ready application boundary: `aps_api/executor.py`
+  introduces a minimal `PlanExecutor` abstraction (`SyncPlanExecutor`
+  today). `PlanningService` composes an injectable executor and
+  `create_app(service=...)` accepts one, so a future phase can evolve
+  `POST /plans` synchronous execution into job creation -> worker -> result
+  retrieval (the worker runs the same executor payload contract) without
+  rewriting the routes, the service boundary or the core engine. No
+  Celery/Redis/broker/queue infrastructure is implemented.
+- **P6 (complete)** — API integration tests: `tests/test_api_http.py`
+  (TestClient against the real app, no external server/database) covers
+  `/health`, `/version`, valid planning requests (default,
+  `weighted_tardiness`, `makespan`, params override), invalid objective
+  (400), malformed requests / schema violations (422), valid-but-infeasible
+  datasets (200 + `schedule: null` + diagnostics), diagnostics/root-cause
+  preservation (MATERIAL_SHORTAGE and EMPLOYEE_SHORTAGE fixtures), JSON
+  serialization, no-solver-internal assertions and the structured error
+  envelope; `tests/test_api_service.py` covers the service/executor/schema
+  contracts directly (including executor injection and
+  validation-before-solve). `tests/test_packaging.py` gained subprocess
+  regressions proving `python -m aps_engine` and the installed `aps-engine`
+  console entry point remain functional.
+- **P7 (complete)** — documentation & reconciliation: this file and
+  `README.md` updated with the Phase 9 surface (start the API locally,
+  `/health`, `/version`, `POST /plans`, request/response behaviour,
+  infeasibility semantics, example curl commands, test command); test count
+  (410) recorded; all Phase 9 commits pushed. No solver, model, validator,
+  generator or CLI behaviour changed.
+
 ## Next planned phase
 
-None — Phases 1 through 8 (the documented roadmap, including the Phase 8
-productionization: persistence, service API facade and packaging) are fully
-implemented. Any future phase is not planned in this repository yet.
+None — Phases 1 through 9 (the documented roadmap, including the Phase 8
+productionization: persistence, service API facade and packaging, and the
+Phase 9 HTTP/Application API foundation) are fully implemented. Phase 9 is
+the final planned phase; no further phase is planned in this repository yet.
