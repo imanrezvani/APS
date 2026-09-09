@@ -17,7 +17,16 @@ Endpoints:
 """
 
 from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from aps_api.errors import (
+    PlanningError,
+    http_error_handler,
+    planning_error_handler,
+    unhandled_error_handler,
+    validation_error_handler,
+)
 from aps_api.routes.plans import router as plans_router
 from aps_api.service import PlanningService
 from aps_api.version import get_package_version, get_service_name
@@ -34,6 +43,13 @@ def create_app() -> FastAPI:
         version=get_package_version(),
     )
     application.state.service = PlanningService()
+
+    application.add_exception_handler(PlanningError, planning_error_handler)
+    application.add_exception_handler(
+        RequestValidationError, validation_error_handler)
+    application.add_exception_handler(
+        StarletteHTTPException, http_error_handler)
+    application.add_exception_handler(Exception, unhandled_error_handler)
 
     @application.get("/health", tags=["system"])
     def health() -> dict:

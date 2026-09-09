@@ -1,9 +1,12 @@
-"""Planning route handlers (Phase 9 P2).
+"""Planning route handlers (Phase 9 P2/P3).
 
 ``POST /plans`` accepts a Phase 8 dataset JSON document and returns the
 planning result. The handler is deliberately thin: it parses the request,
 delegates to the application boundary (``aps_api.service.PlanningService``)
-and returns the JSON-safe response. No solver/model logic lives here.
+and returns the JSON-safe response typed by :class:`aps_api.schemas`.
+No solver/model logic lives here and no engine internals leak into the
+response; validation failures raise the domain ``PlanningError`` which the
+application error handlers translate into a deterministic 4xx envelope.
 """
 
 from typing import Optional
@@ -32,4 +35,4 @@ def create_plan(payload: PlanningRequest, http_request: Request) -> PlanningResp
     if service is None:
         raise RuntimeError("planning service is not configured on the application")
     document = service.create_plan(payload.model_dump())
-    return PlanningResponse(**document)
+    return PlanningResponse.model_validate(document)

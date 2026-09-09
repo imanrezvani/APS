@@ -127,3 +127,111 @@ def test_plan_infeasible_dataset_is_not_server_error(client, infeasible_dataset_
     assert len(body["result"]["diagnostics"]) > 0
     codes = {d["code"] for d in body["result"]["diagnostics"]}
     assert "MATERIAL_SHORTAGE" in codes
+
+
+# --------------------------------------------------------------------------- P3
+# Explicit contracts and deterministic 4xx errors.
+
+ERROR_BODY_CODES = {404, 422, 400}
+
+
+def _assert_error_envelope(response):
+    """Structured error envelope, no framework shapes, no stack leaks."""
+    assert response.status_code in ERROR_BODY_CODES
+    body = response.json()
+    assert set(body) == {"error"}
+    assert set(body["error"]) <= {"code", "message", "details"}
+    assert "code" in body["error"] and "message" in body["error"]
+    assert isinstance(body["error"]["code"], str)
+    assert isinstance(body["error"]["message"], str)
+    assert "Traceback" not in response.text
+    assert "<class" not in response.text
+
+
+def test_plan_unknown_objective_400(client, material_dataset_document):
+    response = client.post(
+        "/plans", json={"dataset": material_dataset_document, "objective": "does_not_exist"}
+    )
+    assert response.status_code == 400
+    _assert_error_envelope(response)
+    assert response.json()["error"]["code"] == "UNKNOWN_OBJECTIVE"
+    assert "weighted_tardiness" in response.json()["error"]["message"]
+
+
+def test_plan_invalid_dataset_document_400(client):
+    response = client.post(
+        "/plans",
+        json={"dataset": {"format": "v0", "orders": []}, "objective": "makespan"},
+    )
+    assert response.status_code == 400
+    _assert_error_envelope(response)
+    assert response.json()["error"]["code"] == "INVALID_DATASET_DOCUMENT"
+
+
+def test_plan_missing_dataset_422(client):
+    response = client.post("/plans", json={"objective": "makespan"})
+    assert response.status_code == 422
+    _assert_error_envelope(response)
+    body = response.json()["error"]
+    assert body["code"] == "VALIDATION_ERROR"
+    assert any("dataset" in str(d["loc"]) for d in body["details"])
+
+
+def test_plan_extra_field_rejected_422(client, material_dataset_document):
+    response = client.post(
+        "/plans", json={"dataset": material_dataset_document, "unexpected": True}
+    )
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "VALIDATION_ERROR"
+
+
+def test_plan_bad_params_range_422(client, material_dataset_document):
+    response = client.post(
+        "/plans",
+        json={
+            "dataset": material_dataset_document,
+            "params": {"time_limit_seconds": 0},
+        },
+    )
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "VALIDATION_ERROR"
+
+
+def test_plan_malformed_json_422(client, material_dataset_document):
+    raw = '{"dataset": ' + str(material_dataset_document)[:20]
+    response = client.post("/plans", content=raw, headers={"content-type": "application/json"})
+    assert response.status_code == 422
+    _assert_error_envelope(response)
+    assert response.json()["error"]["code"] == "VALIDATION_ERROR"
+
+
+def test_404_uses_error_envelope(client):
+    response = client.get("/definitely-missing")
+    assert response.status_code == 404
+    _assert_error_envelope(response)
+    assert response.json()["error"]["code"] == "HTTP_404"
+
+
+def test_no_solver_internals_in_success(client, material_dataset_document):
+    response = client.post("/plans", json={"dataset": material_dataset_document})
+    text = response.text
+    assert "CpSolverStatus" not in text
+    assert "cp_model" not in text
+    assert "class" not in text.split("schedule")[0]
+    assert "objective_value" in response.json()["result"]
+
+
+def test_no_solver_internals_in_error(client, material_dataset_document):
+    response = client.post(
+        "/plans", json={"dataset": material_dataset_document, "objective": "nope"}
+    )
+    assert "CpSolverStatus" not in response.text
+    assert "objective_registry" not in response.text
+
+
+def test_success_payload_is_json_serializable(client, material_dataset_document):
+    import json as _json
+
+    response = client.post("/plans", json={"dataset": material_dataset_document})
+    assert response.status_code == 200
+    _json.dumps(response.json())
