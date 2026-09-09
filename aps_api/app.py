@@ -16,6 +16,8 @@ Endpoints:
   planning result through the existing ``aps_engine.api.plan`` facade.
 """
 
+from typing import Optional
+
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -32,8 +34,13 @@ from aps_api.service import PlanningService
 from aps_api.version import get_package_version, get_service_name
 
 
-def create_app() -> FastAPI:
-    """Build and return the FastAPI application."""
+def create_app(service: Optional[PlanningService] = None) -> FastAPI:
+    """Build and return the FastAPI application.
+
+    ``service`` is injectable (S9-P5): a future async phase or an embedding
+    host can substitute a job-backed ``PlanningService`` without changing the
+    routes. It defaults to the synchronous service.
+    """
     application = FastAPI(
         title="APS Engine API",
         description=(
@@ -42,7 +49,7 @@ def create_app() -> FastAPI:
         ),
         version=get_package_version(),
     )
-    application.state.service = PlanningService()
+    application.state.service = service if service is not None else PlanningService()
 
     application.add_exception_handler(PlanningError, planning_error_handler)
     application.add_exception_handler(

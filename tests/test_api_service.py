@@ -1,13 +1,15 @@
-"""Phase 9 P3 service-boundary and schema-contract unit tests.
+"""Phase 9 P3/P5 service-boundary, schema and executor unit tests.
 
-Direct unit tests of the application boundary (``aps_api.service``) and the
-Pydantic contracts (``aps_api.schemas``) that the HTTP integration tests in
-``test_api_http.py`` exercise end-to-end. These verify the boundary
-guarantees without an HTTP server: planning payloads are ResultDocument
-compatible (feasible 200-like payload / infeasible with diagnostics), domain
-validation happens before any planner call and raises ``PlanningError``, the
-default solver params mirror the engine, and the schemas reject unknown
-fields and out-of-range settings deterministically.
+Direct unit tests of the application boundary (``aps_api.service``,
+``aps_api.executor``) and the Pydantic contracts (``aps_api.schemas``) that
+the HTTP integration tests in ``test_api_http.py`` exercise end-to-end.
+These verify the boundary guarantees without an HTTP server: planning
+payloads are ResultDocument compatible (feasible 200-like payload /
+infeasible with diagnostics), domain validation happens before any planner
+call and raises ``PlanningError``, the default solver params mirror the
+engine, the schemas reject unknown fields and out-of-range settings
+deterministically, and the executor abstraction (S9-P5) lets a future async
+backend be injected without changing the routes or the payload contract.
 """
 
 import json
@@ -91,7 +93,7 @@ def test_service_validation_happens_before_solve(monkeypatch, material_document)
         calls.append((args, kwargs))
         raise AssertionError("planner must not run for an invalid objective")
 
-    monkeypatch.setattr("aps_api.service.plan", fake_plan)
+    monkeypatch.setattr("aps_api.executor.plan", fake_plan)
     with pytest.raises(PlanningError):
         service = PlanningService()
         service.create_plan({"dataset": material_document, "objective": "nope"})
@@ -99,7 +101,7 @@ def test_service_validation_happens_before_solve(monkeypatch, material_document)
 
 
 def test_service_default_solver_params_match_engine():
-    from aps_api.service import _solver_params
+    from aps_api.executor import _solver_params
 
     params = _solver_params("makespan", None)
     assert isinstance(params, SolverParams)
@@ -110,7 +112,7 @@ def test_service_default_solver_params_match_engine():
 
 
 def test_service_solver_params_overrides():
-    from aps_api.service import _solver_params
+    from aps_api.executor import _solver_params
 
     params = _solver_params(
         "weighted_tardiness", {"time_limit_seconds": 7, "random_seed": 9}
@@ -153,3 +155,81 @@ def test_schema_response_round_trip(service, material_document):
     assert response.schedule is not None
     assert response.schedule.objective_value == response.result.objective_value
     assert response.model_dump(mode="json") == document
+
+
+# -------------------------------------------------------------------- P5
+# Async-ready application boundary (executor injection, no queue infra).
+
+from fastapi.testclient import TestClient
+
+from aps_api.app import create_app
+from aps_api.executor import PlanExecutor as PlanningExecutor
+from aps_api.executor import SyncPlanExecutor
+
+_FAKE_PAYLOAD = {
+    "result": {
+        "status": "OPTIMAL",
+        "status_code": 0,
+        "feasible": True,
+        "objective_value": 1.0,
+        "best_bound": 1.0,
+        "num_conflicts": 0,
+        "num_branches": 0,
+        "wall_time": 0.0,
+        "diagnostics": [],
+    },
+    "schedule": None,
+}
+
+
+class _FakeExecutor(PlanningExecutor):
+    def __init__(self):
+        self.calls = []
+
+    def execute(self, request):
+        self.calls.append(request)
+        return _FAKE_PAYLOAD
+
+
+class _RecordingSyncExecutor(SyncPlanExecutor):
+    def __init__(self):
+        super().__init__()
+        self.calls = []
+
+    def execute(self, request):
+        self.calls.append(request)
+        return super().execute(request)
+
+
+def test_service_defaults_to_sync_executor():
+    service = PlanningService()
+    assert isinstance(service.executor, SyncPlanExecutor)
+
+
+def test_service_routes_through_injected_executor():
+    fake = _FakeExecutor()
+    service = PlanningService(executor=fake)
+    payload = service.create_plan({"dataset": {"orders": []}})
+    assert payload == _FAKE_PAYLOAD
+    assert fake.calls == [{"dataset": {"orders": []}}]
+
+
+def test_service_preserves_executor_contract(material_document):
+    recording = _RecordingSyncExecutor()
+    service = PlanningService(executor=recording)
+    payload = service.create_plan({"dataset": material_document, "objective": "makespan"})
+    assert payload["result"]["feasible"] is True
+    assert payload["schedule"] is not None
+    assert recording.calls[0]["objective"] == "makespan"
+
+
+def test_app_accepts_injected_service():
+    fake = _FakeExecutor()
+    app = create_app(service=PlanningService(executor=fake))
+    client = TestClient(app)
+    response = client.post(
+        "/plans", json={"dataset": {"orders": []}, "objective": "makespan"}
+    )
+    assert response.status_code == 200
+    assert response.json() == _FAKE_PAYLOAD
+    assert fake.calls
