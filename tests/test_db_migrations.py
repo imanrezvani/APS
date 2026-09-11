@@ -12,12 +12,18 @@ from aps_persistence import migrate  # noqa: E402
 BASELINE = "0001_phase10_baseline"
 
 
+def _head_revision(url: str) -> str:
+    from alembic.script import ScriptDirectory
+
+    return ScriptDirectory.from_config(migrate.alembic_config(url)).get_current_head()
+
+
 def test_alembic_config_points_at_repo_migrations(test_database_url):
     config = migrate.alembic_config(test_database_url)
     assert config.get_main_option("script_location").endswith("alembic")
 
 
-def test_upgrade_reaches_baseline_revision(migrated_database):
+def test_upgrade_reaches_head_revision(migrated_database):
     engine = create_engine(migrated_database, future=True)
     try:
         assert "alembic_version" in inspect(engine).get_table_names()
@@ -25,12 +31,13 @@ def test_upgrade_reaches_baseline_revision(migrated_database):
             version = connection.execute(
                 text("SELECT version_num FROM alembic_version")
             ).scalar()
-        assert version == BASELINE
+        assert version == _head_revision(migrated_database)
     finally:
         engine.dispose()
 
 
 def test_downgrade_and_reupgrade_is_deterministic(migrated_database):
+    head = _head_revision(migrated_database)
     migrate.downgrade(migrated_database, "base")
     engine = create_engine(migrated_database, future=True)
     try:
@@ -49,6 +56,6 @@ def test_downgrade_and_reupgrade_is_deterministic(migrated_database):
             version = connection.execute(
                 text("SELECT version_num FROM alembic_version")
             ).scalar()
-        assert version == BASELINE
+        assert version == head
     finally:
         engine.dispose()
