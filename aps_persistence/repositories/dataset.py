@@ -145,6 +145,25 @@ class DatasetRepository:
         self.session.refresh(record)
         return record
 
+    def find_or_create(
+        self,
+        dataset: Dataset,
+        *,
+        name: Optional[str] = None,
+        extra_meta: Optional[Dict[str, Any]] = None,
+    ) -> DatasetRecord:
+        """Return an existing dataset with the same canonical content or create one.
+
+        Content identity is the sha256 of the canonical JSON document, so
+        planning the same dataset twice links both runs to one dataset row.
+        """
+        text = dataset_to_json(dataset)
+        sha256 = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        existing = self.find_by_sha256(sha256)
+        if existing:
+            return existing[0]
+        return self.create(dataset, name=name, extra_meta=extra_meta)
+
     def delete(self, dataset_id: str) -> bool:
         """Delete a dataset and (via FK cascade) its projection rows."""
         record = self.get_record(dataset_id)

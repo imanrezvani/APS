@@ -11,6 +11,7 @@ dataset document and the objective happens in the service boundary before
 any planner execution, so an invalid payload never reaches the solver.
 """
 
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
@@ -48,6 +49,11 @@ class PlanningRequest(BaseModel):
     )
     params: Optional[PlanningParams] = Field(
         default=None, description="Optional solver settings."
+    )
+    dataset_id: Optional[str] = Field(
+        default=None,
+        description="When persistence is configured, plan this already-stored "
+        "dataset instead of creating one from the document.",
     )
 
 
@@ -133,6 +139,72 @@ class PlanningResponse(BaseModel):
 
     result: ResultInfo
     schedule: Optional[Schedule] = None
+
+
+# --------------------------------------------------- datasets (Phase 10 P5)
+
+class DatasetCreateRequest(BaseModel):
+    """POST /datasets request body."""
+
+    model_config = {"extra": "forbid"}
+
+    dataset: Dict[str, Any] = Field(
+        description="Dataset document in the Phase 8 JSON dataset format."
+    )
+    name: Optional[str] = Field(default=None, description="Optional dataset name.")
+    meta: Optional[Dict[str, Any]] = Field(
+        default=None, description="Optional metadata stored alongside the dataset."
+    )
+
+
+class DatasetSummary(BaseModel):
+    """Dataset metadata row (used by list/detail responses)."""
+
+    model_config = {"extra": "forbid"}
+
+    id: str
+    name: Optional[str] = None
+    format: str
+    sha256: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class DatasetDetail(DatasetSummary):
+    """A dataset including its canonical document and metadata."""
+
+    meta: Dict[str, Any] = Field(default_factory=dict)
+    document: Dict[str, Any]
+
+
+# ----------------------------------------------------- plans (Phase 10 P5)
+
+class PlanSummary(BaseModel):
+    """Planning run metadata row."""
+
+    model_config = {"extra": "forbid"}
+
+    id: str
+    dataset_id: Optional[str] = None
+    objective: str
+    status: str
+    outcome: Optional[str] = None
+    result_status: Optional[str] = None
+    feasible: Optional[bool] = None
+    created_at: datetime
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+
+
+class PlanDetail(PlanSummary):
+    """A planning run including its result, schedule and diagnostics."""
+
+    params: Dict[str, Any] = Field(default_factory=dict)
+    result: Optional[ResultInfo] = None
+    schedule: Optional[Schedule] = None
+    diagnostics: List[Diagnostic] = Field(default_factory=list)
+    error_code: Optional[str] = None
+    error_message: Optional[str] = None
 
 
 class ErrorBody(BaseModel):

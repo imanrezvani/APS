@@ -44,6 +44,21 @@ class PlanningError(Exception):
         super().__init__(message)
 
 
+class NotFoundError(Exception):
+    """A persisted resource was not found (mapped to HTTP 404)."""
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        details: Optional[List[Any]] = None,
+    ) -> None:
+        self.code = code
+        self.message = message
+        self.details = details
+        super().__init__(message)
+
+
 def _error_payload(code: str, message: str, details: Optional[List[Any]] = None) -> Dict[str, Any]:
     return ErrorResponse(
         error={"code": code, "message": message, "details": details}
@@ -54,6 +69,14 @@ async def planning_error_handler(request: Request, exc: PlanningError) -> JSONRe
     """400 for a rejected planning request (invalid dataset/objective)."""
     return JSONResponse(
         status_code=400,
+        content=_error_payload(exc.code, exc.message, exc.details),
+    )
+
+
+async def not_found_error_handler(request: Request, exc: NotFoundError) -> JSONResponse:
+    """404 for an unknown persisted dataset or planning run."""
+    return JSONResponse(
+        status_code=404,
         content=_error_payload(exc.code, exc.message, exc.details),
     )
 

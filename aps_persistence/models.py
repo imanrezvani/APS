@@ -65,7 +65,12 @@ OUTCOME_EXECUTION_FAILURE = "execution_failure"
 
 # Error codes that mark a rejected (invalid) request rather than a failure.
 INVALID_REQUEST_CODES = frozenset(
-    {"INVALID_DATASET_DOCUMENT", "UNKNOWN_OBJECTIVE", "VALIDATION_ERROR"}
+    {
+        "INVALID_DATASET_DOCUMENT",
+        "UNKNOWN_OBJECTIVE",
+        "VALIDATION_ERROR",
+        "DATASET_NOT_FOUND",
+    }
 )
 
 
