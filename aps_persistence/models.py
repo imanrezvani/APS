@@ -101,7 +101,7 @@ class DatasetRecord(Base):
         nullable=False,
     )
 
-    runs = relationship("PlanningRunRecord", back_populates="dataset")
+    runs = relationship("PlanningRunRecord", back_populates="dataset", passive_deletes=True)
 
 
 class FactoryRecord(Base):
@@ -356,7 +356,7 @@ class PlanningRunRecord(Base):
     started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
 
-    dataset = relationship("DatasetRecord", back_populates="runs")
+    dataset = relationship("DatasetRecord", back_populates="runs", passive_deletes=True)
 
 
 def classify_outcome(
