@@ -9,5 +9,14 @@ from aps_persistence.repositories.dataset import (
     DatasetNotFoundError,
     DatasetRepository,
 )
+from aps_persistence.repositories.planning_run import (
+    PlanningRunNotFoundError,
+    PlanningRunRepository,
+)
 
-__all__ = ["DatasetNotFoundError", "DatasetRepository"]
+__all__ = [
+    "DatasetNotFoundError",
+    "DatasetRepository",
+    "PlanningRunNotFoundError",
+    "PlanningRunRepository",
+]
